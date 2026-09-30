@@ -21,6 +21,9 @@ const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// Version reported by `--version`, taken from the crate manifest.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Largest accepted `--text` value, in bytes.
+const MAX_TEXT: usize = 8 * 1024;
+
 /// Resolved options for a normal server run.
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
@@ -57,7 +60,7 @@ A tiny multilingual hello-world HTTP server.
 
 Options:
   -l, --lang <CODE>    Language code for the greeting (default: en)
-  -t, --text <STRING>  Custom greeting, replaces the greeting entirely
+  -t, --text <STRING>  Custom greeting, replaces the greeting entirely (max 8 KiB)
   -p, --port <PORT>    TCP port (default: 21212, 0 = any free port)
       --host <IP>      IP address to bind (default: 127.0.0.1)
       --list-langs     List supported language codes and exit
@@ -144,7 +147,11 @@ fn parse_args(argv: &[String]) -> Result<Command, String> {
                 }
             }
             "-t" | "--text" => {
-                options.text = Some(flag_value(argv, &mut index, name, inline)?);
+                let value = flag_value(argv, &mut index, name, inline)?;
+                if value.len() > MAX_TEXT {
+                    return Err(format!("--text is longer than {MAX_TEXT} bytes"));
+                }
+                options.text = Some(value);
             }
             "-p" | "--port" => {
                 let value = flag_value(argv, &mut index, name, inline)?;
@@ -403,6 +410,21 @@ mod tests {
     #[test]
     fn text_flag_sets_custom_greeting() {
         assert_eq!(run_options(&["--text", "Hi"]).text, Some("Hi".to_string()));
+    }
+
+    #[test]
+    fn text_of_exactly_max_length_is_accepted() {
+        let value = "a".repeat(MAX_TEXT);
+        assert_eq!(run_options(&["--text", value.as_str()]).text, Some(value));
+    }
+
+    #[test]
+    fn text_longer_than_max_length_is_an_error() {
+        let value = "a".repeat(MAX_TEXT + 1);
+        assert_eq!(
+            parse_args(&argv(&["--text", value.as_str()])),
+            Err(format!("--text is longer than {MAX_TEXT} bytes"))
+        );
     }
 
     #[test]

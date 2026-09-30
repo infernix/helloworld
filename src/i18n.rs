@@ -9,7 +9,7 @@ pub const DEFAULT_CODE: &str = "en";
 /// A single catalog entry: BCP-47-ish code, native display name, greeting.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Lang {
-    /// Lowercase primary language subtag, e.g. `nl`, `pt-BR`.
+    /// Lowercase primary language subtag, e.g. `nl`, `zh`.
     pub code: &'static str,
     /// Name of the language written in that language.
     pub name: &'static str,

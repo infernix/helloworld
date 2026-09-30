@@ -14,6 +14,9 @@ cargo build --release
 
 The binary lands at `./target/release/helloworld`.
 
+The minimum supported Rust version is 1.74 (declared as `rust-version` in `Cargo.toml`); CI builds the
+crate with that toolchain, so the MSRV claim is verified on every run.
+
 ## Usage
 
 ```
@@ -23,7 +26,7 @@ A tiny multilingual hello-world HTTP server.
 
 Options:
   -l, --lang <CODE>    Language code for the greeting (default: en)
-  -t, --text <STRING>  Custom greeting, replaces the greeting entirely
+  -t, --text <STRING>  Custom greeting, replaces the greeting entirely (max 8 KiB)
   -p, --port <PORT>    TCP port (default: 21212, 0 = any free port)
       --host <IP>      IP address to bind (default: 127.0.0.1)
       --list-langs     List supported language codes and exit
@@ -46,13 +49,17 @@ Examples:
 
 Flags accept both `--flag value` and `--flag=value` forms. Unknown flags and flags without a value
 exit non-zero with a message on stderr. An unsupported language code also exits non-zero, prints the
-error on stderr and lists the supported codes.
+error on stderr and lists the supported codes. A `--text` value longer than 8 KiB is rejected as a usage
+error: the program exits with status 2 and prints the error on stderr.
 
 The server binds `<host>:<port>` (default `127.0.0.1:21212`) and handles each connection on its own
 thread, with at most 256 connections served at once. Connections beyond that limit receive
 `503 Service Unavailable` with a `Retry-After: 1` header; up to 64 rejections run concurrently on their
 own threads, so a slow client cannot stall the accept loop, and any further connections are closed
-immediately. Each connection has a 10s read timeout and a 10s write timeout; after the response is written
+immediately. Each connection uses a single file descriptor, so the 256-connection cap fits inside a
+default 1024-descriptor limit. Each connection has a 10s read timeout and a 10s write timeout, and the
+10s request deadline is enforced on every socket read, so a client that trickles the request head or body
+one byte at a time is still answered with `408` within 10 s. After the response is written
 the write side is half-closed and the read side drained for at most 500 ms in total before the socket is
 closed. On startup one line is printed with the address actually bound:
 `helloworld listening on http://127.0.0.1:<port> (language: <en|custom (--text)|<code>>)`.
@@ -85,7 +92,7 @@ the path.
 
 ### Access log
 
-One line is written to stdout per served request, in this exact format:
+For each served request one line is queued for stdout, in this exact format:
 
 ```
 {ISO8601-UTC} {peer|"-"} {method} {path} lang={lang} status={code} dur={ms:.1}ms
@@ -102,6 +109,11 @@ serving the request in milliseconds with one decimal. For example:
 The startup line and the access log are written to stdout; usage errors, bind, accept and spawn
 failures, and connection errors that are not client disconnects are written to stderr. A client that
 disconnects mid-request is normal and is not logged as an error.
+
+Access log lines pass through a bounded in-process queue that a single writer thread drains, so logging
+never blocks the request path. When the log consumer stalls (for example a full pipe that nobody reads),
+the queue fills and further lines are dropped rather than blocking a connection; the request is still
+served and its response is unaffected.
 
 ## Endpoints
 

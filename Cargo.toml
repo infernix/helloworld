@@ -6,6 +6,9 @@ rust-version = "1.74"
 description = "Multilingual hello-world HTTP server with zero dependencies"
 license = "MIT"
 readme = "README.md"
+documentation = "https://docs.rs/helloworld"
+keywords = ["http-server", "i18n", "hello-world", "multilingual", "cli"]
+categories = ["web-programming::http-server", "command-line-utilities"]
 
 [[bin]]
 name = "helloworld"
@@ -18,4 +21,4 @@ strip = true
 
 [lints.rust]
 unsafe_code = "forbid"
-missing_docs = "warn"
+missing_docs = "deny"

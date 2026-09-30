@@ -8,6 +8,7 @@
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -59,6 +60,9 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// Maximum number of characters logged per field.
 const MAX_LOG_FIELD: usize = 120;
 
+/// Largest number of queued access log lines before new lines are dropped.
+const LOG_QUEUE: usize = 256;
+
 /// `Server` response header value.
 const SERVER: &str = concat!("helloworld/", env!("CARGO_PKG_VERSION"));
 
@@ -99,6 +103,7 @@ struct RequestInfo {
 /// Accept errors back off briefly instead of spinning.
 pub fn serve(listener: TcpListener, config: Arc<Config>) {
     let active = Arc::new(AtomicUsize::new(0));
+    let logger = Logger::start();
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
@@ -119,6 +124,7 @@ pub fn serve(listener: TcpListener, config: Arc<Config>) {
                     Some(Arc::clone(&config))
                 };
                 let counter = Arc::clone(&active);
+                let logger = logger.clone();
                 let name = if busy {
                     "helloworld-reject"
                 } else {
@@ -131,13 +137,13 @@ pub fn serve(listener: TcpListener, config: Arc<Config>) {
                         let _guard = ActiveGuard(counter);
                         match config {
                             Some(config) => {
-                                if let Err(err) = handle_connection(stream, &config) {
+                                if let Err(err) = handle_connection(stream, &config, &logger) {
                                     if !is_disconnect(&err) {
                                         eprintln!("helloworld: connection error: {err}");
                                     }
                                 }
                             }
-                            None => reject_busy(stream),
+                            None => reject_busy(&stream),
                         }
                     });
                 if let Err(err) = spawned {
@@ -163,12 +169,13 @@ impl Drop for ActiveGuard {
 }
 
 /// Answer a connection that arrived while the server was at capacity.
-fn reject_busy(mut stream: TcpStream) {
+fn reject_busy(stream: &TcpStream) {
     // The client sees the 503; the operator needs the overload in the log too.
     eprintln!("helloworld: at capacity ({MAX_CONNECTIONS} connections), answering 503");
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    let mut writer = stream;
     let _ = respond(
-        &mut stream,
+        &mut writer,
         "503 Service Unavailable",
         &[("Retry-After", "1")],
         "busy\n",
@@ -183,11 +190,12 @@ fn reject_busy(mut stream: TcpStream) {
 /// sending a request body, and draining whatever it sends prevents a TCP reset from
 /// discarding the response before the client has read it. Draining stops after
 /// [`LINGER_TIMEOUT`] in total, or after [`MAX_LINGER_BYTES`] bytes.
-fn lingering_close(mut stream: TcpStream) {
+fn lingering_close(stream: &TcpStream) {
     let _ = stream.shutdown(Shutdown::Write);
     let deadline = Instant::now() + LINGER_TIMEOUT;
     let mut scratch = [0_u8; 4096];
     let mut drained = 0_usize;
+    let mut stream = stream;
     while drained < MAX_LINGER_BYTES {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
@@ -201,33 +209,34 @@ fn lingering_close(mut stream: TcpStream) {
 }
 
 /// Apply the socket timeouts and serve one connection.
-fn handle_connection(stream: TcpStream, config: &Config) -> std::io::Result<()> {
+fn handle_connection(stream: TcpStream, config: &Config, logger: &Logger) -> std::io::Result<()> {
     let started = Instant::now();
     let peer = stream.peer_addr().ok();
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     stream.set_nodelay(true)?;
-    // One file descriptor per role keeps the descriptor count at three per
-    // connection, so `MAX_CONNECTIONS` fits inside a default 1024 fd limit.
-    let mut reader = BufReader::new(stream.try_clone()?);
+    // A single descriptor serves the reader, the deadline and the writer, so
+    // `MAX_CONNECTIONS + MAX_REJECTS` connections fit inside a default
+    // 1024-descriptor limit.
+    let mut reader = BufReader::new(&stream);
     let mut deadline = SocketDeadline {
-        stream: stream.try_clone()?,
+        stream: &stream,
         deadline: Instant::now() + HEAD_TIMEOUT,
     };
-    let mut writer = stream;
+    let mut writer = &stream;
     match handle(&mut reader, &mut writer, config, &mut deadline) {
-        Ok(Some(info)) => log(peer, &info, started.elapsed()),
+        Ok(Some(info)) => logger.send(log_line(peer, &info, started.elapsed())),
         Ok(None) => {}
         Err(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
             // A socket read timeout means the request never arrived in time;
             // answer 408 instead of surfacing an error the client never sees.
             if let Some(info) = answer_timeout(&mut writer) {
-                log(peer, &info, started.elapsed());
+                logger.send(log_line(peer, &info, started.elapsed()));
             }
         }
         Err(err) => return Err(err),
     }
-    lingering_close(writer);
+    lingering_close(&stream);
     Ok(())
 }
 
@@ -276,28 +285,58 @@ enum ReadLine {
 ///
 /// A line is accepted iff its content — excluding one trailing `\n` and an optional
 /// preceding `\r` — is at most `limit` bytes; a line of exactly `limit` bytes is
-/// therefore valid. Reading stops at the first `\n` (or EOF); invalid UTF-8 is
-/// replaced rather than reported, and the caller supplies the scratch buffer so a
-/// connection reuses one allocation.
-fn read_line<R: BufRead>(reader: &mut R, limit: usize, buf: &mut Vec<u8>) -> io::Result<ReadLine> {
+/// therefore valid. The deadline is re-armed before every socket read, so a trickled
+/// line cannot outlive the request head deadline. Reading stops at the first `\n` (or
+/// EOF); invalid UTF-8 is replaced rather than reported, and the caller supplies the
+/// scratch buffer so a connection reuses one allocation.
+fn read_line<R: BufRead, D: Deadline>(
+    reader: &mut R,
+    limit: usize,
+    buf: &mut Vec<u8>,
+    deadline: &mut D,
+) -> io::Result<ReadLine> {
     buf.clear();
-    // `limit + 2` covers a maximal content of `limit` bytes plus CRLF.
-    let read = (&mut *reader)
-        .take(limit as u64 + 2)
-        .read_until(b'\n', buf)?;
-    if read == 0 {
-        return Ok(ReadLine::Eof);
+    loop {
+        deadline.arm()?;
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if buf.is_empty() {
+                ReadLine::Eof
+            } else {
+                finish_line(buf, limit)
+            });
+        }
+        match available.iter().position(|&byte| byte == b'\n') {
+            Some(index) => {
+                buf.extend_from_slice(&available[..index]);
+                reader.consume(index + 1);
+                return Ok(finish_line(buf, limit));
+            }
+            None => {
+                let len = available.len();
+                buf.extend_from_slice(available);
+                reader.consume(len);
+                // `limit + 2` covers a maximal content of `limit` bytes plus CRLF.
+                if buf.len() >= limit + 2 {
+                    return Ok(ReadLine::TooLong);
+                }
+            }
+        }
     }
-    if buf.last() == Some(&b'\n') {
-        buf.pop();
-    }
+}
+
+/// Classify a line whose trailing CRLF has already been removed from the input.
+///
+/// Strips one trailing `\r` and returns [`ReadLine::TooLong`] when more than
+/// `limit` content bytes remain.
+fn finish_line(buf: &mut Vec<u8>, limit: usize) -> ReadLine {
     if buf.last() == Some(&b'\r') {
         buf.pop();
     }
     if buf.len() > limit {
-        return Ok(ReadLine::TooLong);
+        return ReadLine::TooLong;
     }
-    Ok(ReadLine::Line(String::from_utf8_lossy(buf).to_string()))
+    ReadLine::Line(String::from_utf8_lossy(buf).to_string())
 }
 
 /// Arms the read deadline before each blocking read of the request.
@@ -314,14 +353,14 @@ impl Deadline for () {
 }
 
 /// Deadline that shrinks the socket read timeout to the time left before it expires.
-struct SocketDeadline {
+struct SocketDeadline<'a> {
     /// Socket whose read timeout is adjusted.
-    stream: TcpStream,
+    stream: &'a TcpStream,
     /// Instant after which the whole request head is late.
     deadline: Instant,
 }
 
-impl Deadline for SocketDeadline {
+impl Deadline for SocketDeadline<'_> {
     fn arm(&mut self) -> io::Result<()> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -332,6 +371,14 @@ impl Deadline for SocketDeadline {
         }
         self.stream
             .set_read_timeout(Some(remaining.min(READ_TIMEOUT)))
+    }
+}
+
+/// Turn a deadline expiry into a `408`; other errors pass through.
+fn timeout_or<W: Write>(writer: &mut W, err: io::Error) -> io::Result<Option<RequestInfo>> {
+    match err.kind() {
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => Ok(answer_timeout(writer)),
+        _ => Err(err),
     }
 }
 
@@ -351,15 +398,10 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
 
     // Skip any leading blank lines, then read the request line.
     let request_line = loop {
-        if let Err(err) = deadline.arm() {
-            return match err.kind() {
-                ErrorKind::TimedOut | ErrorKind::WouldBlock => Ok(answer_timeout(writer)),
-                _ => Err(err),
-            };
-        }
-        match read_line(reader, MAX_REQUEST_LINE, &mut buf)? {
-            ReadLine::Eof => return Ok(None),
-            ReadLine::TooLong => {
+        match read_line(reader, MAX_REQUEST_LINE, &mut buf, deadline) {
+            Err(err) => return timeout_or(writer, err),
+            Ok(ReadLine::Eof) => return Ok(None),
+            Ok(ReadLine::TooLong) => {
                 return fail(
                     writer,
                     "-",
@@ -369,7 +411,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                     false,
                 );
             }
-            ReadLine::Line(line) => {
+            Ok(ReadLine::Line(line)) => {
                 if !line.is_empty() {
                     break line;
                 }
@@ -428,15 +470,10 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut header_bytes = 0_usize;
     loop {
-        if let Err(err) = deadline.arm() {
-            return match err.kind() {
-                ErrorKind::TimedOut | ErrorKind::WouldBlock => Ok(answer_timeout(writer)),
-                _ => Err(err),
-            };
-        }
-        match read_line(reader, MAX_HEADER_LINE, &mut buf)? {
-            ReadLine::Eof => break,
-            ReadLine::TooLong => {
+        match read_line(reader, MAX_HEADER_LINE, &mut buf, deadline) {
+            Err(err) => return timeout_or(writer, err),
+            Ok(ReadLine::Eof) => break,
+            Ok(ReadLine::TooLong) => {
                 return fail(
                     writer,
                     method,
@@ -446,7 +483,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                     head_only,
                 );
             }
-            ReadLine::Line(line) => {
+            Ok(ReadLine::Line(line)) => {
                 if line.is_empty() {
                     break;
                 }
@@ -604,10 +641,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
     let mut scratch = [0_u8; 8192];
     while remaining > 0 {
         if let Err(err) = deadline.arm() {
-            return match err.kind() {
-                ErrorKind::TimedOut | ErrorKind::WouldBlock => Ok(answer_timeout(writer)),
-                _ => Err(err),
-            };
+            return timeout_or(writer, err);
         }
         let read = (&mut *reader).take(remaining).read(&mut scratch)?;
         if read == 0 {
@@ -894,14 +928,55 @@ fn iso8601(time: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-/// Write one access log line to stdout, tolerating a closed pipe.
-fn log(peer: Option<SocketAddr>, info: &RequestInfo, elapsed: Duration) {
+/// Bounded access-log sink: handlers enqueue, one writer thread drains to stdout.
+#[derive(Clone)]
+struct Logger {
+    /// Queue shared with the writer thread.
+    sender: mpsc::SyncSender<String>,
+}
+
+impl Logger {
+    /// Start the writer thread and return a handle to it.
+    ///
+    /// The thread locks stdout once and writes every received line until the queue
+    /// closes or a write fails, so a blocked stdout can never stall a connection.
+    fn start() -> Logger {
+        let (sender, receiver) = mpsc::sync_channel::<String>(LOG_QUEUE);
+        let spawned = thread::Builder::new()
+            .name("helloworld-log".to_string())
+            .spawn(move || {
+                let mut stdout = io::stdout().lock();
+                for line in receiver {
+                    if writeln!(stdout, "{line}").is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(err) = spawned {
+            eprintln!("helloworld: failed to spawn log writer: {err}");
+        }
+        Logger { sender }
+    }
+
+    /// Enqueue one line, dropping it when the queue is full or the writer is gone.
+    fn send(&self, line: String) {
+        let _ = self.sender.try_send(line);
+    }
+
+    /// A logger that hands lines to the caller instead of a thread.
+    #[cfg(test)]
+    fn capturing() -> (Logger, mpsc::Receiver<String>) {
+        let (sender, receiver) = mpsc::sync_channel(LOG_QUEUE);
+        (Logger { sender }, receiver)
+    }
+}
+
+/// Format one access log line.
+fn log_line(peer: Option<SocketAddr>, info: &RequestInfo, elapsed: Duration) -> String {
     let peer = peer
         .map(|addr| addr.to_string())
         .unwrap_or_else(|| "-".to_string());
-    let mut stdout = io::stdout().lock();
-    let _ = writeln!(
-        stdout,
+    format!(
         "{} {} {} {} lang={} status={} dur={:.1}ms",
         iso8601(SystemTime::now()),
         peer,
@@ -910,7 +985,7 @@ fn log(peer: Option<SocketAddr>, info: &RequestInfo, elapsed: Duration) {
         sanitize(&info.lang),
         info.code(),
         elapsed.as_secs_f64() * 1000.0,
-    );
+    )
 }
 
 /// Replace control characters and truncate to [`MAX_LOG_FIELD`] characters.
@@ -1341,7 +1416,7 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         let client = TcpStream::connect(addr).expect("connect");
         let (server, _) = listener.accept().expect("accept");
-        reject_busy(server);
+        reject_busy(&server);
 
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1360,7 +1435,10 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         let mut client = TcpStream::connect(addr).expect("connect");
         let (server, _) = listener.accept().expect("accept");
-        let handler = thread::spawn(move || handle_connection(server, &default_config()));
+        let handler = thread::spawn(move || {
+            let (logger, _lines) = Logger::capturing();
+            handle_connection(server, &default_config(), &logger)
+        });
 
         client
             .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello")
@@ -1483,17 +1561,46 @@ mod tests {
         let body = "x".repeat(100);
         let request =
             format!("GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{body}");
+        // The head now consumes one arm per trickled byte, so the budget must
+        // outlast the whole head and still expire inside the body drain.
+        let head = request.find("\r\n\r\n").expect("head") + 4;
         let mut reader = BufReader::new(Trickle::new(request.into_bytes()));
         let mut writer = Vec::new();
         let info = handle(
             &mut reader,
             &mut writer,
             &default_config(),
-            &mut CountdownDeadline { arms: 5 },
+            &mut CountdownDeadline { arms: head + 6 },
         )
         .expect("handle must succeed")
         .expect("served");
         assert_eq!(info.status, "408 Request Timeout");
+    }
+
+    #[test]
+    fn trickled_head_is_request_timeout() {
+        let request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut reader = BufReader::new(Trickle::new(request.as_bytes().to_vec()));
+        let mut writer = Vec::new();
+        let info = handle(
+            &mut reader,
+            &mut writer,
+            &default_config(),
+            &mut CountdownDeadline { arms: 4 },
+        )
+        .expect("handle must succeed")
+        .expect("served");
+        assert_eq!(info.status, "408 Request Timeout");
+    }
+
+    #[test]
+    fn a_full_log_queue_drops_lines_instead_of_blocking() {
+        let (logger, lines) = Logger::capturing();
+        for index in 0..LOG_QUEUE * 2 {
+            logger.send(format!("line {index}"));
+        }
+        drop(logger);
+        assert_eq!(lines.iter().count(), LOG_QUEUE);
     }
 
     #[test]
@@ -1504,7 +1611,7 @@ mod tests {
         let (server, _) = listener.accept().expect("accept");
         let (done, finished) = std::sync::mpsc::channel();
         let handle = thread::spawn(move || {
-            lingering_close(server);
+            lingering_close(&server);
             done.send(()).expect("send");
         });
         // Keep the read side fed so only the deadline can stop the drain.
