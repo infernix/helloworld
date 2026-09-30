@@ -5,12 +5,12 @@
 //! status code instead of an error, and the response builder is generic over the
 //! writer so the whole layer can be unit tested without a socket.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::i18n;
 
@@ -32,11 +32,23 @@ const MAX_BODY: usize = 8 * 1024 * 1024;
 /// Largest number of connections served concurrently.
 const MAX_CONNECTIONS: usize = 256;
 
+/// Stack size for a connection handler thread.
+const HANDLER_STACK: usize = 256 * 1024;
+
 /// Read timeout applied to every accepted connection.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Write timeout applied to every accepted connection.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline for reading one complete request head (request line + headers).
+const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the read side is drained after a response before closing.
+const LINGER_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Largest number of bytes read while draining a half-closed connection.
+const MAX_LINGER_BYTES: usize = 64 * 1024;
 
 /// Pause after a failed `accept` before trying again.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
@@ -86,15 +98,19 @@ pub fn serve(listener: TcpListener, config: Arc<Config>) {
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
-                if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                // Reserve the slot before spawning so the count can never exceed the
+                // cap: two threads racing here cannot both observe a free slot.
+                let previous = active.fetch_add(1, Ordering::Relaxed);
+                if previous >= MAX_CONNECTIONS {
+                    active.fetch_sub(1, Ordering::Relaxed);
                     reject_busy(stream);
                     continue;
                 }
-                active.fetch_add(1, Ordering::Relaxed);
                 let config = Arc::clone(&config);
                 let counter = Arc::clone(&active);
                 let spawned = thread::Builder::new()
                     .name("helloworld-conn".to_string())
+                    .stack_size(HANDLER_STACK)
                     .spawn(move || {
                         let _guard = ActiveGuard(counter);
                         if let Err(err) = handle_connection(stream, &config) {
@@ -125,6 +141,8 @@ impl Drop for ActiveGuard {
 
 /// Answer a connection that arrived while the server was at capacity.
 fn reject_busy(mut stream: TcpStream) {
+    // The client sees the 503; the operator needs the overload in the log too.
+    eprintln!("helloworld: at capacity ({MAX_CONNECTIONS} connections), answering 503");
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let _ = respond(
         &mut stream,
@@ -133,18 +151,73 @@ fn reject_busy(mut stream: TcpStream) {
         "busy\n",
         false,
     );
+    lingering_close(stream);
+}
+
+/// Half-close the write side, then drain the read side until EOF.
+///
+/// The half-close lets the client see the complete response even while it is still
+/// sending a request body, and draining whatever it sends prevents a TCP reset from
+/// discarding the response before the client has read it.
+fn lingering_close(mut stream: TcpStream) {
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(LINGER_TIMEOUT));
+    let mut scratch = [0_u8; 4096];
+    let mut drained = 0_usize;
+    while drained < MAX_LINGER_BYTES {
+        match stream.read(&mut scratch) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => drained += read,
+        }
+    }
 }
 
 /// Apply the socket timeouts and serve one connection.
 fn handle_connection(stream: TcpStream, config: &Config) -> std::io::Result<()> {
+    let started = Instant::now();
+    let peer = stream.peer_addr().ok();
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    stream.set_nodelay(true)?;
+    // One file descriptor per role keeps the descriptor count at three per
+    // connection, so `MAX_CONNECTIONS` fits inside a default 1024 fd limit.
     let mut reader = BufReader::new(stream.try_clone()?);
+    let mut deadline = SocketDeadline {
+        stream: stream.try_clone()?,
+        deadline: Instant::now() + HEAD_TIMEOUT,
+    };
     let mut writer = stream;
-    if let Some(info) = handle(&mut reader, &mut writer, config)? {
-        log(&info);
+    match handle(&mut reader, &mut writer, config, &mut deadline) {
+        Ok(Some(info)) => log(peer, &info, started.elapsed()),
+        Ok(None) => {}
+        Err(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+            // A socket read timeout means the head never arrived in time; answer
+            // 408 instead of surfacing an error the client never sees.
+            if let Some(info) = answer_timeout(&mut writer) {
+                log(peer, &info, started.elapsed());
+            }
+        }
+        Err(err) => return Err(err),
     }
+    lingering_close(writer);
     Ok(())
+}
+
+/// Write the `408 Request Timeout` response and describe it.
+///
+/// Shared by `handle` (deadline expired) and `handle_connection` (socket read
+/// timeout) so both paths produce byte-identical output; the request may be
+/// unparsed, hence the `-` method/path/lang.
+fn answer_timeout<W: Write>(writer: &mut W) -> Option<RequestInfo> {
+    reply(
+        writer,
+        RequestInfo::new("-", "-", "-", "408 Request Timeout"),
+        "request timeout\n",
+        &[],
+        false,
+    )
+    .ok()
+    .flatten()
 }
 
 /// Outcome of reading one line.
@@ -157,45 +230,91 @@ enum ReadLine {
     Eof,
 }
 
-/// Read one CRLF-terminated line, bounded by `limit` bytes excluding the CRLF.
+/// Read one line, bounded by `limit` bytes of content.
 ///
-/// Invalid UTF-8 is replaced rather than reported, and the caller supplies the
-/// scratch buffer so a connection reuses one allocation.
-fn read_line<R: BufRead>(
-    reader: &mut R,
-    limit: usize,
-    buf: &mut Vec<u8>,
-) -> std::io::Result<ReadLine> {
+/// A line is accepted iff its content — excluding one trailing `\n` and an optional
+/// preceding `\r` — is at most `limit` bytes; a line of exactly `limit` bytes is
+/// therefore valid. Reading stops at the first `\n` (or EOF); invalid UTF-8 is
+/// replaced rather than reported, and the caller supplies the scratch buffer so a
+/// connection reuses one allocation.
+fn read_line<R: BufRead>(reader: &mut R, limit: usize, buf: &mut Vec<u8>) -> io::Result<ReadLine> {
     buf.clear();
+    // `limit + 2` covers a maximal content of `limit` bytes plus CRLF.
     let read = (&mut *reader)
-        .take(limit as u64 + 1)
+        .take(limit as u64 + 2)
         .read_until(b'\n', buf)?;
     if read == 0 {
         return Ok(ReadLine::Eof);
     }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
     if buf.len() > limit {
         return Ok(ReadLine::TooLong);
     }
-    Ok(ReadLine::Line(
-        String::from_utf8_lossy(buf)
-            .trim_end_matches(['\r', '\n'])
-            .to_string(),
-    ))
+    Ok(ReadLine::Line(String::from_utf8_lossy(buf).to_string()))
+}
+
+/// Arms the read deadline before each blocking read of the request head.
+trait Deadline {
+    /// Arm the deadline; fails once it has already passed.
+    fn arm(&mut self) -> io::Result<()>;
+}
+
+/// No-op deadline, used by tests that drive `handle` without a socket.
+impl Deadline for () {
+    fn arm(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Deadline that shrinks the socket read timeout to the time left before it expires.
+struct SocketDeadline {
+    /// Socket whose read timeout is adjusted.
+    stream: TcpStream,
+    /// Instant after which the whole request head is late.
+    deadline: Instant,
+}
+
+impl Deadline for SocketDeadline {
+    fn arm(&mut self) -> io::Result<()> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                "request head deadline exceeded",
+            ));
+        }
+        self.stream
+            .set_read_timeout(Some(remaining.min(READ_TIMEOUT)))
+    }
 }
 
 /// Parse one request and write the response.
 ///
 /// Returns `None` when the peer closed the connection before sending a request
-/// line, and otherwise the description of what was served.
-fn handle<R: BufRead, W: Write>(
+/// line, and otherwise the description of what was served. `deadline` bounds the
+/// whole request head (and the body drain), so a client that stalls mid-head is
+/// answered with `408` rather than holding a thread.
+fn handle<R: BufRead, W: Write, D: Deadline>(
     reader: &mut R,
     writer: &mut W,
     config: &Config,
-) -> std::io::Result<Option<RequestInfo>> {
+    deadline: &mut D,
+) -> io::Result<Option<RequestInfo>> {
     let mut buf = Vec::new();
 
     // Skip any leading blank lines, then read the request line.
     let request_line = loop {
+        if let Err(err) = deadline.arm() {
+            return match err.kind() {
+                ErrorKind::TimedOut | ErrorKind::WouldBlock => Ok(answer_timeout(writer)),
+                _ => Err(err),
+            };
+        }
         match read_line(reader, MAX_REQUEST_LINE, &mut buf)? {
             ReadLine::Eof => return Ok(None),
             ReadLine::TooLong => {
@@ -260,6 +379,12 @@ fn handle<R: BufRead, W: Write>(
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut header_bytes = 0_usize;
     loop {
+        if let Err(err) = deadline.arm() {
+            return match err.kind() {
+                ErrorKind::TimedOut | ErrorKind::WouldBlock => Ok(answer_timeout(writer)),
+                _ => Err(err),
+            };
+        }
         match read_line(reader, MAX_HEADER_LINE, &mut buf)? {
             ReadLine::Eof => break,
             ReadLine::TooLong => {
@@ -317,15 +442,27 @@ fn handle<R: BufRead, W: Write>(
 
     let mut content_length: Option<u64> = None;
     for (_, value) in headers.iter().filter(|(name, _)| name == "content-length") {
+        // A valid Content-Length is `1*DIGIT`; anything else is malformed.
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return fail(
+                writer,
+                method,
+                &path,
+                "400 Bad Request",
+                "bad request\n",
+                head_only,
+            );
+        }
+        // Digits-only but overflowing `u64` or the body cap is too large.
         let parsed = match value.parse::<u64>() {
-            Ok(parsed) => parsed,
-            Err(_) => {
+            Ok(parsed) if parsed <= MAX_BODY as u64 => parsed,
+            _ => {
                 return fail(
                     writer,
                     method,
                     &path,
-                    "400 Bad Request",
-                    "bad request\n",
+                    "413 Payload Too Large",
+                    "payload too large\n",
                     head_only,
                 );
             }
@@ -341,24 +478,45 @@ fn handle<R: BufRead, W: Write>(
                     head_only,
                 );
             }
-        } else if parsed > MAX_BODY as u64 {
-            return fail(
-                writer,
-                method,
-                &path,
-                "413 Payload Too Large",
-                "payload too large\n",
-                head_only,
-            );
         }
         content_length = Some(parsed);
     }
 
-    if header(&headers, "expect").is_some_and(|value| value.eq_ignore_ascii_case("100-continue")) {
-        writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
-        writer.flush()?;
+    if !host_is_valid(version, &headers) {
+        return fail(
+            writer,
+            method,
+            &path,
+            "400 Bad Request",
+            "bad request\n",
+            head_only,
+        );
     }
 
+    match header(&headers, "expect") {
+        Some(value) if value.eq_ignore_ascii_case("100-continue") => {
+            writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            writer.flush()?;
+        }
+        Some(_) => {
+            return fail(
+                writer,
+                method,
+                &path,
+                "417 Expectation Failed",
+                "expectation failed\n",
+                head_only,
+            );
+        }
+        None => {}
+    }
+
+    if let Err(err) = deadline.arm() {
+        return match err.kind() {
+            ErrorKind::TimedOut | ErrorKind::WouldBlock => Ok(answer_timeout(writer)),
+            _ => Err(err),
+        };
+    }
     let len = content_length.unwrap_or(0);
     let mut limited = (&mut *reader).take(len);
     let copied = io::copy(&mut limited, &mut io::sink())?;
@@ -373,26 +531,30 @@ fn handle<R: BufRead, W: Write>(
         );
     }
 
-    let (status, lang, body, extra): (&'static str, String, String, &[(&str, &str)]) = match method
-    {
+    let (status, lang, body, extra): (
+        &'static str,
+        String,
+        String,
+        Vec<(&'static str, &'static str)>,
+    ) = match method {
         "GET" | "HEAD" => match path.as_str() {
             "/" => {
-                let (lang, body) = greeting(config, &headers);
-                ("200 OK", lang, body, &[])
+                let (lang, body, extra) = greeting(config, &headers);
+                ("200 OK", lang, body, extra)
             }
-            "/healthz" => ("200 OK", "-".to_string(), "ok\n".to_string(), &[]),
+            "/healthz" => ("200 OK", "-".to_string(), "ok\n".to_string(), Vec::new()),
             _ => (
                 "404 Not Found",
                 "-".to_string(),
                 "not found\n".to_string(),
-                &[],
+                Vec::new(),
             ),
         },
         _ => (
             "405 Method Not Allowed",
             "-".to_string(),
             "method not allowed\n".to_string(),
-            &[("Allow", "GET, HEAD")],
+            vec![("Allow", "GET, HEAD")],
         ),
     };
 
@@ -400,7 +562,7 @@ fn handle<R: BufRead, W: Write>(
         writer,
         RequestInfo::new(method, &path, &lang, status),
         &body,
-        extra,
+        &extra,
         head_only,
     )
 }
@@ -414,6 +576,11 @@ impl RequestInfo {
             lang: lang.to_string(),
             status,
         }
+    }
+
+    /// The three-digit status code, for the access log.
+    fn code(&self) -> &str {
+        self.status.get(..3).unwrap_or(self.status)
     }
 }
 
@@ -447,16 +614,27 @@ fn fail<W: Write>(
     )
 }
 
-/// Resolve the greeting for a request following the documented precedence:
-/// `--text`, then `--lang`, then `Accept-Language`, then the default.
-fn greeting(config: &Config, headers: &[(String, String)]) -> (String, String) {
+/// Resolve the greeting and response headers for a request.
+///
+/// Follows the documented precedence: `--text`, then `--lang`, then
+/// `Accept-Language`, then the default. `Content-Language` (and `Vary` for
+/// negotiation) reflects the language actually served; `--text` serves a fixed
+/// string, so it advertises neither.
+fn greeting(
+    config: &Config,
+    headers: &[(String, String)],
+) -> (String, String, Vec<(&'static str, &'static str)>) {
     if let Some(text) = &config.text {
         let mut body = text.clone();
         body.push('\n');
-        return ("custom".to_string(), body);
+        return ("custom".to_string(), body, Vec::new());
     }
     if let Some(code) = config.lang {
-        return (code.to_string(), format!("{}\n", i18n::greeting_for(code)));
+        return (
+            code.to_string(),
+            format!("{}\n", i18n::greeting_for(code)),
+            vec![("Content-Language", code)],
+        );
     }
     let negotiated = header(headers, "accept-language")
         .and_then(i18n::negotiate)
@@ -464,6 +642,10 @@ fn greeting(config: &Config, headers: &[(String, String)]) -> (String, String) {
     (
         negotiated.to_string(),
         format!("{}\n", i18n::greeting_for(negotiated)),
+        vec![
+            ("Content-Language", negotiated),
+            ("Vary", "Accept-Language"),
+        ],
     )
 }
 
@@ -473,6 +655,26 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .iter()
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.as_str())
+}
+
+/// Whether the `Host` header(s) satisfy the request's HTTP version.
+///
+/// HTTP/1.1 requires exactly one non-empty, ASCII-graphic `Host`; HTTP/1.0 makes
+/// it optional but still rejects duplicates.
+fn host_is_valid(version: &str, headers: &[(String, String)]) -> bool {
+    let mut host = None;
+    let mut count = 0_usize;
+    for (_, value) in headers.iter().filter(|(name, _)| name == "host") {
+        count += 1;
+        host = Some(value.as_str());
+    }
+    if count > 1 {
+        return false;
+    }
+    if version == "HTTP/1.0" {
+        return true;
+    }
+    host.is_some_and(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_graphic()))
 }
 
 /// Serialize one response: status line, fixed headers, extras, then the body.
@@ -507,16 +709,14 @@ fn respond<W: Write>(
     writer.flush()
 }
 
-/// Format `time` as an IMF-fixdate, e.g. `Tue, 29 Feb 2000 00:00:00 GMT`.
-fn http_date(time: SystemTime) -> String {
-    let secs = time
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+/// Split Unix seconds into `(year, month, day, hour, minute, second)` UTC.
+///
+/// Uses Howard Hinnant's `civil_from_days`; shared by [`http_date`] and
+/// [`iso8601`] so the two renderings cannot drift.
+fn civil(secs: u64) -> (u64, u32, u32, u32, u32, u32) {
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400);
 
-    // Howard Hinnant's `civil_from_days`: days since the epoch to a civil date.
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -528,10 +728,27 @@ fn http_date(time: SystemTime) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     year += u64::from(month <= 2);
 
-    let weekday = (days + 4).rem_euclid(7) as usize;
     let hour = secs_of_day / 3600;
     let minute = (secs_of_day % 3600) / 60;
     let second = secs_of_day % 60;
+    (
+        year,
+        month as u32,
+        day as u32,
+        hour as u32,
+        minute as u32,
+        second as u32,
+    )
+}
+
+/// Format `time` as an IMF-fixdate, e.g. `Tue, 29 Feb 2000 00:00:00 GMT`.
+fn http_date(time: SystemTime) -> String {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (year, month, day, hour, minute, second) = civil(secs);
+    let weekday = (secs.div_euclid(86_400) + 4).rem_euclid(7) as usize;
     format!(
         "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
         WEEKDAYS[weekday],
@@ -544,16 +761,32 @@ fn http_date(time: SystemTime) -> String {
     )
 }
 
+/// Format `time` as an ISO 8601 UTC timestamp, e.g. `2026-09-30T11:15:00Z`.
+fn iso8601(time: SystemTime) -> String {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (year, month, day, hour, minute, second) = civil(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 /// Write one access log line to stdout, tolerating a closed pipe.
-fn log(info: &RequestInfo) {
+fn log(peer: Option<SocketAddr>, info: &RequestInfo, elapsed: Duration) {
+    let peer = peer
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "-".to_string());
     let mut stdout = io::stdout().lock();
     let _ = writeln!(
         stdout,
-        "{} {} lang={} status={}",
+        "{} {} {} {} lang={} status={} dur={:.1}ms",
+        iso8601(SystemTime::now()),
+        peer,
         sanitize(&info.method),
         sanitize(&info.path),
         sanitize(&info.lang),
-        info.status
+        info.code(),
+        elapsed.as_secs_f64() * 1000.0,
     );
 }
 
@@ -587,7 +820,7 @@ mod tests {
     fn run(request: &str, config: &Config) -> (String, Option<RequestInfo>) {
         let mut reader = BufReader::new(Cursor::new(request.as_bytes().to_vec()));
         let mut writer = Vec::new();
-        let info = handle(&mut reader, &mut writer, config).expect("handle must succeed");
+        let info = handle(&mut reader, &mut writer, config, &mut ()).expect("handle must succeed");
         let response = String::from_utf8(writer).expect("response must be utf-8");
         (response, info)
     }
@@ -606,9 +839,21 @@ mod tests {
         })
     }
 
+    /// Deadline that is already expired, forcing the `408` path.
+    struct ExpiredDeadline;
+
+    impl Deadline for ExpiredDeadline {
+        fn arm(&mut self) -> io::Result<()> {
+            Err(io::Error::new(ErrorKind::TimedOut, "test"))
+        }
+    }
+
     #[test]
     fn get_root_defaults_to_english() {
-        let (response, info) = run("GET / HTTP/1.1\r\n\r\n", &default_config());
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
         let info = info.expect("a request must be served");
         assert_eq!(info.status, "200 OK");
         assert_eq!(info.lang, "en");
@@ -627,7 +872,7 @@ mod tests {
     #[test]
     fn accept_language_header_is_negotiated() {
         let (response, info) = run(
-            "GET / HTTP/1.1\r\nAccept-Language: de-DE,de;q=0.9\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: de-DE,de;q=0.9\r\n\r\n",
             &default_config(),
         );
         assert_eq!(info.expect("served").lang, "de");
@@ -641,7 +886,7 @@ mod tests {
             text: None,
         };
         let (response, info) = run(
-            "GET / HTTP/1.1\r\nAccept-Language: de-DE,de;q=0.9\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: de-DE,de;q=0.9\r\n\r\n",
             &config,
         );
         assert_eq!(info.expect("served").lang, "nl");
@@ -654,7 +899,10 @@ mod tests {
             lang: Some("nl"),
             text: Some("custom".to_string()),
         };
-        let (response, info) = run("GET / HTTP/1.1\r\nAccept-Language: de-DE\r\n\r\n", &config);
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: de-DE\r\n\r\n",
+            &config,
+        );
         let info = info.expect("served");
         assert_eq!(info.lang, "custom");
         assert_eq!(body(&response), "custom\n");
@@ -662,7 +910,10 @@ mod tests {
 
     #[test]
     fn unknown_path_is_not_found() {
-        let (response, info) = run("GET /nope HTTP/1.1\r\n\r\n", &default_config());
+        let (response, info) = run(
+            "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
         let info = info.expect("served");
         assert_eq!(info.status, "404 Not Found");
         assert_eq!(info.lang, "-");
@@ -671,7 +922,10 @@ mod tests {
 
     #[test]
     fn head_has_no_body_but_keeps_length() {
-        let (response, info) = run("HEAD / HTTP/1.1\r\n\r\n", &default_config());
+        let (response, info) = run(
+            "HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
         assert_eq!(info.expect("served").status, "200 OK");
         assert_eq!(header_value(&response, "Content-Length"), Some("14"));
         assert_eq!(body(&response), "");
@@ -679,7 +933,10 @@ mod tests {
 
     #[test]
     fn other_methods_are_not_allowed() {
-        let (response, info) = run("POST / HTTP/1.1\r\n\r\n", &default_config());
+        let (response, info) = run(
+            "POST / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
         let info = info.expect("served");
         assert_eq!(info.status, "405 Method Not Allowed");
         assert_eq!(header_value(&response, "Allow"), Some("GET, HEAD"));
@@ -689,10 +946,10 @@ mod tests {
     #[test]
     fn body_is_drained() {
         let mut reader = BufReader::new(Cursor::new(
-            b"GET / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
         ));
         let mut writer = Vec::new();
-        let info = handle(&mut reader, &mut writer, &default_config())
+        let info = handle(&mut reader, &mut writer, &default_config(), &mut ())
             .expect("handle must succeed")
             .expect("served");
         assert_eq!(info.status, "200 OK");
@@ -704,7 +961,16 @@ mod tests {
     #[test]
     fn invalid_content_length_is_bad_request() {
         let (_, info) = run(
-            "GET / HTTP/1.1\r\nContent-Length: x\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: x\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn signed_content_length_is_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: +5\r\n\r\n",
             &default_config(),
         );
         assert_eq!(info.expect("served").status, "400 Bad Request");
@@ -713,7 +979,7 @@ mod tests {
     #[test]
     fn conflicting_content_lengths_are_bad_request() {
         let (_, info) = run(
-            "GET / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
             &default_config(),
         );
         assert_eq!(info.expect("served").status, "400 Bad Request");
@@ -722,7 +988,16 @@ mod tests {
     #[test]
     fn oversized_content_length_is_payload_too_large() {
         let (_, info) = run(
-            "GET / HTTP/1.1\r\nContent-Length: 8388609\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8388609\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "413 Payload Too Large");
+    }
+
+    #[test]
+    fn overflowing_content_length_is_payload_too_large() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 99999999999999999999\r\n\r\n",
             &default_config(),
         );
         assert_eq!(info.expect("served").status, "413 Payload Too Large");
@@ -731,11 +1006,49 @@ mod tests {
     #[test]
     fn transfer_encoding_is_not_implemented() {
         let (response, info) = run(
-            "GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n",
             &default_config(),
         );
         assert_eq!(info.expect("served").status, "501 Not Implemented");
         assert_eq!(body(&response), "not implemented\n");
+    }
+
+    #[test]
+    fn http11_without_host_is_bad_request() {
+        let (_, info) = run("GET / HTTP/1.1\r\n\r\n", &default_config());
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn duplicate_host_headers_are_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn empty_host_is_bad_request() {
+        let (_, info) = run("GET / HTTP/1.1\r\nHost: \r\n\r\n", &default_config());
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn http10_without_host_is_served() {
+        let (response, info) = run("GET / HTTP/1.0\r\n\r\n", &default_config());
+        assert_eq!(info.expect("served").status, "200 OK");
+        assert_eq!(body(&response), "Hello, World!\n");
+    }
+
+    #[test]
+    fn unexpected_expectation_is_417() {
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: nope\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "417 Expectation Failed");
+        assert_eq!(body(&response), "expectation failed\n");
     }
 
     #[test]
@@ -747,6 +1060,24 @@ mod tests {
         assert_eq!(info.method, "-");
         assert_eq!(info.path, "-");
         assert_eq!(info.lang, "-");
+    }
+
+    #[test]
+    fn request_line_at_limit_is_served() {
+        let padding = " ".repeat(MAX_REQUEST_LINE - "GET / HTTP/1.1".len());
+        let request = format!("GET / HTTP/1.1{padding}\r\nHost: localhost\r\n\r\n");
+        assert_eq!(request.find("\r\n").expect("line"), MAX_REQUEST_LINE);
+        let (_, info) = run(&request, &default_config());
+        assert_eq!(info.expect("served").status, "200 OK");
+    }
+
+    #[test]
+    fn request_line_over_limit_is_uri_too_long() {
+        let padding = " ".repeat(MAX_REQUEST_LINE - "GET / HTTP/1.1".len() + 1);
+        let request = format!("GET / HTTP/1.1{padding}\r\nHost: localhost\r\n\r\n");
+        assert_eq!(request.find("\r\n").expect("line"), MAX_REQUEST_LINE + 1);
+        let (_, info) = run(&request, &default_config());
+        assert_eq!(info.expect("served").status, "414 URI Too Long");
     }
 
     #[test]
@@ -788,7 +1119,7 @@ mod tests {
     #[test]
     fn expect_continue_is_answered_before_body() {
         let (response, info) = run(
-            "GET / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello",
             &default_config(),
         );
         assert_eq!(info.expect("served").status, "200 OK");
@@ -797,6 +1128,88 @@ mod tests {
             .unwrap_or_else(|| panic!("response was {response:?}"));
         assert!(response.starts_with("HTTP/1.1 100 Continue\r\n\r\n"));
         assert_eq!(body(final_response), "Hello, World!\n");
+    }
+
+    #[test]
+    fn expired_deadline_is_request_timeout() {
+        let mut reader = BufReader::new(Cursor::new(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+        ));
+        let mut writer = Vec::new();
+        let info = handle(
+            &mut reader,
+            &mut writer,
+            &default_config(),
+            &mut ExpiredDeadline,
+        )
+        .expect("handle must succeed")
+        .expect("served");
+        assert_eq!(info.status, "408 Request Timeout");
+        assert_eq!(info.method, "-");
+        assert_eq!(info.path, "-");
+        assert_eq!(info.lang, "-");
+        let response = String::from_utf8(writer).expect("response must be utf-8");
+        assert!(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
+        assert_eq!(body(&response), "request timeout\n");
+    }
+
+    #[test]
+    fn answer_timeout_writes_408() {
+        let mut writer = Vec::new();
+        let info = answer_timeout(&mut writer).expect("served");
+        assert_eq!(info.status, "408 Request Timeout");
+        let response = String::from_utf8(writer).expect("response must be utf-8");
+        assert!(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
+        assert_eq!(body(&response), "request timeout\n");
+    }
+
+    #[test]
+    fn negotiated_route_advertises_language_and_vary() {
+        let (response, _) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: de\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(header_value(&response, "Content-Language"), Some("de"));
+        assert_eq!(header_value(&response, "Vary"), Some("Accept-Language"));
+    }
+
+    #[test]
+    fn configured_language_advertises_only_content_language() {
+        let config = Config {
+            lang: Some("nl"),
+            text: None,
+        };
+        let (response, _) = run("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", &config);
+        assert_eq!(header_value(&response, "Content-Language"), Some("nl"));
+        assert_eq!(header_value(&response, "Vary"), None);
+    }
+
+    #[test]
+    fn custom_text_advertises_no_language_headers() {
+        let config = Config {
+            lang: None,
+            text: Some("hi".to_string()),
+        };
+        let (response, _) = run("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", &config);
+        assert_eq!(header_value(&response, "Content-Language"), None);
+        assert_eq!(header_value(&response, "Vary"), None);
+    }
+
+    #[test]
+    fn other_routes_advertise_no_language_headers() {
+        let (health, _) = run(
+            "GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(header_value(&health, "Content-Language"), None);
+        assert_eq!(header_value(&health, "Vary"), None);
+
+        let (missing, _) = run(
+            "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(header_value(&missing, "Content-Language"), None);
+        assert_eq!(header_value(&missing, "Vary"), None);
     }
 
     #[test]
@@ -819,6 +1232,32 @@ mod tests {
     }
 
     #[test]
+    fn response_is_complete_and_closed_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let handler = thread::spawn(move || handle_connection(server, &default_config()));
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello")
+            .expect("write request");
+        let _ = client.shutdown(Shutdown::Write);
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        let mut reader = BufReader::new(client);
+        let mut response = String::new();
+        reader.read_to_string(&mut response).expect("read response");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "was {response:?}"
+        );
+        assert!(response.ends_with("Hello, World!\n"), "was {response:?}");
+        handler.join().expect("handler").expect("served");
+    }
+
+    #[test]
     fn http_date_formats_known_epochs() {
         assert_eq!(http_date(UNIX_EPOCH), "Thu, 01 Jan 1970 00:00:00 GMT");
         assert_eq!(
@@ -828,6 +1267,19 @@ mod tests {
         assert_eq!(
             http_date(UNIX_EPOCH + Duration::from_secs(951_782_400)),
             "Tue, 29 Feb 2000 00:00:00 GMT"
+        );
+    }
+
+    #[test]
+    fn iso8601_formats_known_instants() {
+        assert_eq!(iso8601(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            iso8601(UNIX_EPOCH + Duration::from_secs(1_000_000_000)),
+            "2001-09-09T01:46:40Z"
+        );
+        assert_eq!(
+            iso8601(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            "2000-02-29T00:00:00Z"
         );
     }
 
@@ -843,7 +1295,10 @@ mod tests {
 
     #[test]
     fn leading_blank_lines_are_skipped() {
-        let (response, info) = run("\r\n\r\nGET / HTTP/1.1\r\n\r\n", &default_config());
+        let (response, info) = run(
+            "\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
         assert_eq!(info.expect("served").status, "200 OK");
         assert_eq!(body(&response), "Hello, World!\n");
     }

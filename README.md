@@ -24,7 +24,7 @@ A tiny multilingual hello-world HTTP server.
 Options:
   -l, --lang <CODE>    Language code for the greeting (default: en)
   -t, --text <STRING>  Custom greeting, replaces the greeting entirely
-  -p, --port <PORT>    TCP port to listen on (default: 21212)
+  -p, --port <PORT>    TCP port (default: 21212, 0 = any free port)
       --host <IP>      IP address to bind (default: 127.0.0.1)
       --list-langs     List supported language codes and exit
   -V, --version        Print version and exit
@@ -51,7 +51,11 @@ error on stderr and lists the supported codes.
 The server binds `<host>:<port>` (default `127.0.0.1:21212`) and handles each connection on its own
 thread, with at most 256 concurrent connections; connections beyond that limit receive
 `503 Service Unavailable` with a `Retry-After: 1` header. Each connection has a 10s read timeout and a
-10s write timeout. One line is logged to stdout per request (method, path, resolved language, status).
+10s write timeout. On startup one line is printed with the address actually bound:
+`helloworld listening on http://127.0.0.1:<port> (language: <en|custom (--text)|<code>>)`.
+
+Passing `--port 0` asks the OS for any free port; the startup line then prints the real port that was
+assigned, which is useful for tests and for scripts that must not collide with an existing service.
 
 ### Request limits
 
@@ -65,6 +69,26 @@ Requests that exceed the parser's limits are rejected with a short plain-text bo
 | Body sent with `Transfer-Encoding` (chunked)                  | `501 Not Implemented`               |
 | HTTP version other than `1.0` or `1.1`                       | `505 HTTP Version Not Supported`     |
 | Malformed request line                                      | `400 Bad Request`                   |
+| HTTP/1.1 request without exactly one valid `Host` header     | `400 Bad Request`                   |
+| `Content-Length` that is not a plain decimal number, or two conflicting values | `400 Bad Request`    |
+| `Expect` header with a value other than `100-continue`        | `417 Expectation Failed`            |
+| Request head not complete within 10 s                         | `408 Request Timeout`               |
+
+### Access log
+
+One line is written to stdout per served request, in this exact format:
+
+```
+{ISO8601-UTC} {peer|"-"} {method} {path} lang={lang} status={code} dur={ms:.1}ms
+```
+
+The fields are, in order: the ISO-8601 UTC timestamp, the peer address (or `-` when unavailable), the
+request method, the request path, the resolved language, the response status code, and the time spent
+serving the request in milliseconds with one decimal. For example:
+
+```
+2026-09-30T11:15:00Z 127.0.0.1:54321 GET / lang=en status=200 dur=0.4ms
+```
 
 ## Endpoints
 
@@ -81,6 +105,15 @@ Requests that exceed the parser's limits are rejected with a short plain-text bo
 
 Every response carries `Date` (IMF-fixdate, GMT), `Server: helloworld/<version>`,
 `Content-Type: text/plain; charset=utf-8`, `Content-Length`, and `Connection: close`.
+
+Responses to `/` may carry two additional headers:
+
+- `Content-Language: <code>` — sent when the greeting came from the catalog, i.e. whenever `--text` was
+  not given.
+- `Vary: Accept-Language` — sent only when the greeting was negotiated from the request's
+  `Accept-Language` header. `--lang` and `--text` suppress it.
+
+`/healthz`, the error responses and every other response carry no extra headers.
 
 ## Greeting resolution precedence
 
@@ -165,3 +198,16 @@ helloworld --text 'Bonjour le monde!' --port 21213
 curl -s -H 'Accept-Language: ru' http://127.0.0.1:21213/
 # -> Bonjour le monde!
 ```
+
+## Testing
+
+```sh
+cargo test
+```
+
+This runs the unit tests and the `tests/cli.rs` integration suite, which starts the real binary on an
+ephemeral port (`--port 0`) and speaks HTTP to it.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -1,0 +1,322 @@
+//! End-to-end tests: run the real binary and speak HTTP over a loopback socket.
+//!
+//! Every request is raw text; HTTP/1.1 requests carry a `Host` header because
+//! the server rejects 1.1 requests without exactly one valid `Host`.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::time::Duration;
+
+/// Read/write timeout for the test client socket.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A running server child process plus the pipe its access log is written to.
+struct Server {
+    /// The spawned binary.
+    child: Child,
+    /// The ephemeral port it actually bound.
+    port: u16,
+    /// Retained reader over the child's stdout, positioned after the startup line.
+    stdout: BufReader<ChildStdout>,
+}
+
+impl Server {
+    /// Spawn the binary with `--port 0` plus `extra_args`, and parse its startup line.
+    ///
+    /// Panics with the child's stderr text if the startup line is missing.
+    fn start(extra_args: &[&str]) -> Server {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_helloworld"));
+        command.arg("--port").arg("0");
+        command.args(extra_args);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn helloworld");
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        match stdout.read_line(&mut line) {
+            Ok(n) if n > 0 => match parse_startup_port(&line) {
+                Some(port) => Server {
+                    child,
+                    port,
+                    stdout,
+                },
+                None => panic!("unexpected startup line: {line:?}"),
+            },
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                panic!("server printed no startup line; stderr: {stderr}");
+            }
+        }
+    }
+
+    /// Read one access-log line from the child's stdout.
+    fn next_log_line(&mut self) -> String {
+        let mut line = String::new();
+        let n = self
+            .stdout
+            .read_line(&mut line)
+            .expect("read access log line");
+        assert!(n > 0, "server stdout closed before an access log line");
+        line
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Extract the port from `helloworld listening on http://127.0.0.1:<port> (language: ...)`.
+fn parse_startup_port(line: &str) -> Option<u16> {
+    let rest = line.split_once("http://")?.1;
+    let addr = rest.split_whitespace().next()?;
+    addr.rsplit_once(':')?.1.parse().ok()
+}
+
+/// Send `raw` to `127.0.0.1:port` and return the whole response as text.
+///
+/// The server answers with `Connection: close`, so `read_to_end` ends at EOF.
+fn request(port: u16, raw: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.set_read_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+    stream.set_write_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+    stream.write_all(raw.as_bytes()).expect("write request");
+    stream.flush().unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).expect("read response");
+    String::from_utf8(buf).expect("response is UTF-8")
+}
+
+/// The body of `response`, i.e. everything after the blank line.
+fn body(response: &str) -> &str {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("")
+}
+
+/// The value of `name` (case-insensitive) in the response head, if present.
+fn header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+    let head = response.split("\r\n\r\n").next().unwrap_or("");
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+/// The status line of `response`.
+fn status(response: &str) -> &str {
+    response.lines().next().unwrap_or("")
+}
+
+/// Run the binary to completion and return `(exit code, stdout, stderr)`.
+fn run(args: &[&str]) -> (i32, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_helloworld"))
+        .args(args)
+        .output()
+        .expect("run helloworld");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn version_flag_prints_version_and_exits_zero() {
+    let (code, stdout, _) = run(&["--version"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout,
+        format!("helloworld {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn help_flag_prints_usage_and_exits_zero() {
+    let (code, stdout, _) = run(&["--help"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("Usage: helloworld"),
+        "usage text missing from {stdout:?}"
+    );
+}
+
+#[test]
+fn list_langs_prints_the_catalog() {
+    let (code, stdout, _) = run(&["--list-langs"]);
+    assert_eq!(code, 0);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 22, "expected 22 locales, got {stdout:?}");
+    for line in lines {
+        let (code, name) = line.split_once('\t').expect("tab-separated row");
+        assert!(
+            !code.is_empty() && !name.is_empty(),
+            "empty field in {line:?}"
+        );
+    }
+}
+
+#[test]
+fn unknown_flag_is_a_usage_error() {
+    let (code, stdout, stderr) = run(&["--bogus"]);
+    assert_eq!(code, 2);
+    assert!(stdout.is_empty(), "unexpected stdout {stdout:?}");
+    assert!(!stderr.is_empty(), "expected an error message on stderr");
+}
+
+#[test]
+fn unsupported_language_is_a_usage_error() {
+    let (code, _, stderr) = run(&["--lang", "klingon"]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("supported codes:"),
+        "stderr should list supported codes: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nl"),
+        "stderr should list codes: {stderr:?}"
+    );
+}
+
+#[test]
+fn get_root_defaults_to_english() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(header(&response, "Content-Length"), Some("14"));
+    assert_eq!(header(&response, "Content-Language"), Some("en"));
+    assert_eq!(header(&response, "Vary"), Some("Accept-Language"));
+    assert_eq!(body(&response), "Hello, World!\n");
+}
+
+#[test]
+fn accept_language_is_negotiated() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: de-DE,de;q=0.9\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(header(&response, "Content-Language"), Some("de"));
+    assert_eq!(body(&response), "Hallo, Welt!\n");
+}
+
+#[test]
+fn lang_flag_wins_over_accept_language() {
+    let server = Server::start(&["--lang", "nl"]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: ru\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(body(&response), "Hallo, wereld!\n");
+    assert_eq!(header(&response, "Content-Language"), Some("nl"));
+    assert_eq!(header(&response, "Vary"), None);
+}
+
+#[test]
+fn text_flag_replaces_the_greeting() {
+    let server = Server::start(&["--text", "Hi there"]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: de\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(body(&response), "Hi there\n");
+    assert_eq!(header(&response, "Content-Language"), None);
+    assert_eq!(header(&response, "Vary"), None);
+}
+
+#[test]
+fn head_returns_headers_without_a_body() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "HEAD / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(header(&response, "Content-Length"), Some("14"));
+    assert_eq!(body(&response), "");
+}
+
+#[test]
+fn unknown_path_is_404() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 404 Not Found");
+    assert_eq!(header(&response, "Content-Language"), None);
+}
+
+#[test]
+fn post_is_405_with_allow_header() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 405 Method Not Allowed");
+    assert_eq!(header(&response, "Allow"), Some("GET, HEAD"));
+}
+
+#[test]
+fn http11_without_host_is_400() {
+    let server = Server::start(&[]);
+    let response = request(server.port, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
+fn healthz_returns_ok() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(body(&response), "ok\n");
+    assert_eq!(header(&response, "Content-Language"), None);
+}
+
+#[test]
+fn access_log_line_matches_the_contract() {
+    let mut server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+
+    let line = server.next_log_line();
+    let mut fields = line.split(' ');
+    let timestamp = fields.next().expect("timestamp field");
+    assert!(
+        timestamp.len() == 20
+            && timestamp.ends_with('Z')
+            && timestamp.as_bytes()[4] == b'-'
+            && timestamp.as_bytes()[10] == b'T',
+        "timestamp is not ISO8601 UTC: {timestamp:?}"
+    );
+    let peer = fields.next().expect("peer field");
+    assert!(
+        peer == "-" || peer.starts_with("127.0.0.1:"),
+        "unexpected peer field: {peer:?}"
+    );
+    assert!(
+        line.contains(" GET / lang=en status=200 dur="),
+        "unexpected access log line: {line:?}"
+    );
+    assert!(line.ends_with("ms\n"), "missing duration: {line:?}");
+}

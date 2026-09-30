@@ -6,6 +6,7 @@ mod http;
 mod i18n;
 
 use std::env;
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::process;
@@ -25,7 +26,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 struct Options {
     /// IP address to bind.
     host: IpAddr,
-    /// TCP port to listen on.
+    /// TCP port to listen on; `0` asks the OS for any free port.
     port: u16,
     /// Language code for the greeting, if one was requested.
     lang: Option<&'static str>,
@@ -57,7 +58,7 @@ A tiny multilingual hello-world HTTP server.
 Options:
   -l, --lang <CODE>    Language code for the greeting (default: en)
   -t, --text <STRING>  Custom greeting, replaces the greeting entirely
-  -p, --port <PORT>    TCP port to listen on (default: {DEFAULT_PORT})
+  -p, --port <PORT>    TCP port (default: 21212, 0 = any free port)
       --host <IP>      IP address to bind (default: 127.0.0.1)
       --list-langs     List supported language codes and exit
   -V, --version        Print version and exit
@@ -148,8 +149,8 @@ fn parse_args(argv: &[String]) -> Result<Command, String> {
             "-p" | "--port" => {
                 let value = flag_value(argv, &mut index, name, inline)?;
                 match value.parse::<u16>() {
-                    Ok(port) if port != 0 => options.port = port,
-                    _ => return Err(format!("invalid port '{value}'")),
+                    Ok(port) => options.port = port,
+                    Err(_) => return Err(format!("invalid port '{value}'")),
                 }
             }
             "--host" => {
@@ -170,9 +171,23 @@ fn parse_args(argv: &[String]) -> Result<Command, String> {
     Ok(Command::Run(options))
 }
 
+/// Lossily convert process arguments to `String`s.
+///
+/// Command-line arguments are OS strings and need not be valid UTF-8; a
+/// non-UTF-8 argument is replaced with `U+FFFD` rather than aborting the
+/// process.
+fn collect_args<I>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    args.into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
 /// Entry point: parse the command line, then run, print or fail.
 fn main() {
-    let argv: Vec<String> = env::args().skip(1).collect();
+    let argv = collect_args(env::args_os().skip(1));
 
     let command = match parse_args(&argv) {
         Ok(command) => command,
@@ -212,8 +227,9 @@ fn main() {
         Some(_) => "custom (--text)".to_string(),
         None => options.lang.unwrap_or(i18n::DEFAULT_CODE).to_string(),
     };
+    let bound = listener.local_addr().unwrap_or(addr);
     print_stdout(&format!(
-        "helloworld listening on http://{addr} (language: {active})\n"
+        "helloworld listening on http://{bound} (language: {active})\n"
     ));
 
     let config = Arc::new(http::Config {
@@ -294,11 +310,37 @@ mod tests {
     }
 
     #[test]
-    fn zero_port_is_an_error() {
+    fn zero_port_selects_an_ephemeral_port() {
+        assert_eq!(run_options(&["--port", "0"]).port, 0);
+    }
+
+    #[test]
+    fn port_above_u16_range_is_an_error() {
         assert_eq!(
-            parse_args(&argv(&["--port", "0"])),
-            Err("invalid port '0'".to_string())
+            parse_args(&argv(&["--port", "65536"])),
+            Err("invalid port '65536'".to_string())
         );
+    }
+
+    #[test]
+    fn collect_args_replaces_invalid_utf8_and_keeps_valid() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let args = vec![
+                OsString::from("--lang"),
+                OsString::from_vec(vec![0xff, 0xfe]),
+            ];
+            assert_eq!(
+                collect_args(args),
+                vec!["--lang".to_string(), "\u{fffd}\u{fffd}".to_string()]
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let args = vec![OsString::from("--lang")];
+            assert_eq!(collect_args(args), vec!["--lang".to_string()]);
+        }
     }
 
     #[test]
