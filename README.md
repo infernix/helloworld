@@ -80,29 +80,41 @@ Requests that exceed the parser's limits are rejected with a short plain-text bo
 
 | Condition                                                   | Status                              |
 | ----------------------------------------------------------- | ----------------------------------- |
-| Request line longer than 8 KiB                               | `414 URI Too Long`                  |
+| Request line longer than 8 KiB whose method token is complete (e.g. a long request target) | `414 URI Too Long`                  |
+| Request line longer than 8 KiB whose method token alone is longer than any the server implements | `501 Not Implemented`               |
 | Single header line longer than 8 KiB, headers larger than 64 KiB in total, or more than 100 fields | `431 Request Header Fields Too Large` |
 | Request body larger than 8 MiB, or a `Content-Length` above 8 MiB (checked before the body is read) | `413 Payload Too Large` |
 | A request whose final transfer coding is `chunked` (this server decodes no transfer coding) | `501 Not Implemented` |
 | A request whose final transfer coding is not `chunked`, or an HTTP/1.0 request carrying any `Transfer-Encoding` | `400 Bad Request` |
-| Version token that is not `HTTP/...`                          | `400 Bad Request`                   |
-| `HTTP` major version other than 1, or an `HTTP/1.x` minor that is empty or not numeric | `505 HTTP Version Not Supported` |
-| Malformed request line, method or request target              | `400 Bad Request`                   |
+| Version token that is not `HTTP/` followed by a non-empty run of digits, a `.`, and another non-empty run of digits (e.g. `HTTP/1.`, `HTTP/1.x`, `HTTP/1`) | `400 Bad Request`                   |
+| `HTTP` major version other than 1 (e.g. `HTTP/2.0`, `HTTP/9.9`) | `505 HTTP Version Not Supported`    |
+| Malformed request line, method, or a request target that matches none of the four request-target forms (origin-form, absolute-form, authority-form, asterisk-form; RFC 9112 3.2) | `400 Bad Request`                   |
 | Asterisk-form target (`*`) on a method other than `OPTIONS`    | `400 Bad Request`                   |
 | HTTP/1.1 request without exactly one valid `Host` header      | `400 Bad Request`                   |
 | `Host` field value that is not a valid `uri-host [":" port ]` (RFC 9110 7.2) | `400 Bad Request`                   |
 | `Content-Length` that is not a comma-separated list of valid decimal numerals with the same value (even when one of them overflows) | `400 Bad Request`                   |
 | Malformed header line: no colon, whitespace before the colon, a non-token field name, an obsolete folded continuation line, or a control character in the value | `400 Bad Request` |
 | `Accept-Encoding` that refuses the `identity` coding (RFC 9110 12.5.3) | `406 Not Acceptable`                |
-| `Expect` header with a value other than `100-continue`        | `417 Expectation Failed`            |
+| `Expect` field value containing a member other than `100-continue` (RFC 9110 10.1.1) | `417 Expectation Failed`            |
 | Request head and body not complete within 10 s                  | `408 Request Timeout`               |
 
 `Expect: 100-continue` is answered with `100 Continue` only for HTTP/1.1 requests; in an HTTP/1.0
-request the expectation is ignored (RFC 7231) and the body is read as usual. Absolute-form request
-targets such as `GET http://example.com/ HTTP/1.1` are accepted (RFC 7230); routing and logging use
-the path.
+request the expectation is ignored (RFC 7231) and the body is read as usual. The `Expect` field value is a
+list of expectations and multiple field lines are combined in order (RFC 9110 5.3), with empty list elements
+ignored (RFC 9110 5.6.1): a value whose members are all `100-continue` is handled as a `100-continue`
+expectation (sending `100 Continue` for HTTP/1.1 and ignoring it for HTTP/1.0), a value with a member other
+than `100-continue` is answered `417 Expectation Failed`, and a value that carries no member is treated as
+absent. Absolute-form request targets such as `GET http://example.com/ HTTP/1.1` are accepted (RFC 7230);
+routing and logging use the path. A request target must be one of the four forms (RFC 9112 3.2):
+origin-form (a target starting with `/`), absolute-form (a URI with a scheme),
+authority-form (`uri-host ":" port`, only for `CONNECT`), or asterisk-form (`*`, only for `OPTIONS`); a
+target that matches none of them is answered `400 Bad Request`. A target that starts with `?` (an empty
+path with a query, e.g. `GET ?q=1 HTTP/1.1`) is also accepted and routed and logged as `/` (RFC 3986 6.2.3).
 
-A higher `HTTP/1.x` minor version such as `HTTP/1.2` is processed as HTTP/1.1 (RFC 7230 2.6).
+A higher `HTTP/1.x` minor version such as `HTTP/1.2` is processed as HTTP/1.1 (RFC 7230 2.6). A version
+token that is not `HTTP/` followed by a non-empty digit run, a `.`, and another non-empty digit run (such
+as `HTTP/1.` or `HTTP/1.x`) is malformed and answered `400 Bad Request`, while an unsupported major
+version (such as `HTTP/2.0`) is answered `505 HTTP Version Not Supported`.
 
 The request body length comes from the final transfer coding when a `Transfer-Encoding` is present
 (RFC 9112 6.3); this server decodes no transfer coding, so a final `chunked` coding is answered

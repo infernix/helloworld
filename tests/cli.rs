@@ -463,6 +463,25 @@ fn head_error_response_has_no_body() {
 }
 
 #[test]
+fn over_long_method_is_501() {
+    let server = Server::start(&[]);
+
+    // With no separator in the line, the method token alone exceeds the limit,
+    // so it is longer than any method this server implements.
+    let response = request(server.port, &format!("{}\r\n", "X".repeat(9000)));
+    assert_eq!(status(&response), "HTTP/1.1 501 Not Implemented");
+    assert_eq!(body(&response), "not implemented\n");
+
+    // A complete method with an over-long target is still a URI that is too long.
+    let response = request(
+        server.port,
+        &format!("GET /{}\r\nHost: localhost\r\n\r\n", "a".repeat(9000)),
+    );
+    assert_eq!(status(&response), "HTTP/1.1 414 URI Too Long");
+    assert_eq!(body(&response), "request line too long\n");
+}
+
+#[test]
 fn unknown_path_is_404() {
     let server = Server::start(&[]);
     let response = request(
@@ -557,10 +576,45 @@ fn http12_is_served_as_11() {
 }
 
 #[test]
+fn malformed_version_token_is_400() {
+    let server = Server::start(&[]);
+    let response = request(server.port, "GET / HTTP/1.\r\nHost: localhost\r\n\r\n");
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+
+    let response = request(server.port, "GET / HTTP/1.x\r\nHost: localhost\r\n\r\n");
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
 fn asterisk_form_is_400() {
     let server = Server::start(&[]);
     let response = request(server.port, "GET * HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
+fn invalid_request_target_is_400() {
+    let server = Server::start(&[]);
+
+    // `foo` is neither origin-form, asterisk-form, absolute-form, nor a valid
+    // authority-form.
+    let response = request(server.port, "GET foo HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+
+    // authority-form is only valid for CONNECT, and `foo` has no port.
+    let response = request(
+        server.port,
+        "CONNECT foo HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+
+    // A well-formed authority-form CONNECT is routed like any other method.
+    let response = request(
+        server.port,
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 405 Method Not Allowed");
+    assert_eq!(header(&response, "Allow"), Some("GET, HEAD"));
 }
 
 #[test]
@@ -723,6 +777,47 @@ fn http10_ignores_expect_100_continue() {
     );
     assert_eq!(status(&response), "HTTP/1.1 200 OK");
     assert_eq!(body(&response), "Hello, World!\n");
+}
+
+#[test]
+fn expect_list_members_are_combined() {
+    let server = Server::start(&[]);
+
+    // A member other than `100-continue` makes the whole list unrecognized.
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue, nope\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 417 Expectation Failed");
+    assert_eq!(body(&response), "expectation failed\n");
+
+    // Repeated field lines combine in order, so both members are recognized.
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 100 Continue\r\n\r\n"),
+        "response was {response:?}"
+    );
+    let final_response = response
+        .strip_prefix("HTTP/1.1 100 Continue\r\n\r\n")
+        .expect("100 Continue prefix");
+    assert_eq!(status(final_response), "HTTP/1.1 200 OK");
+    assert_eq!(body(final_response), "Hello, World!\n");
+
+    // An empty list element is ignored, so no member remains and the
+    // expectation is ignored; the body is read as usual with no interim reply.
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: ,\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(body(&response), "Hello, World!\n");
+    assert!(
+        !response.starts_with("HTTP/1.1 100 Continue"),
+        "unexpected interim response: {response:?}"
+    );
 }
 
 #[test]

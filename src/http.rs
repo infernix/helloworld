@@ -608,6 +608,23 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             Ok(ReadLine::TooLong) => {
                 let method = line_method(&buf);
                 let head_only = method == "HEAD";
+                // The separators a request line may use (RFC 9112 3); without one,
+                // the method token alone is already at least the limit long, so it is
+                // longer than any method this server implements (501).
+                let method_is_complete = buf
+                    .iter()
+                    .any(|b| matches!(b, b' ' | b'\t' | b'\x0b' | b'\x0c' | b'\r'));
+                if !method_is_complete {
+                    return fail(
+                        writer,
+                        &method,
+                        "-",
+                        "501 Not Implemented",
+                        "not implemented\n",
+                        VARY_ENCODING,
+                        head_only,
+                    );
+                }
                 return fail(
                     writer,
                     &method,
@@ -647,8 +664,8 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
     // Absolute-form targets are accepted (RFC 7230 5.3.2); routing and
     // logging use the origin-form path only.
     let path = request_path(target).to_string();
-    // Asterisk-form is only valid for a server-wide OPTIONS request (RFC 7230 5.3.4).
-    if target == "*" && method != "OPTIONS" {
+    // The target must match one of the four request-target forms (RFC 9112 3.2).
+    if !target_is_valid(method, target) {
         return fail(
             writer,
             method,
@@ -670,27 +687,30 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             head_only,
         );
     }
-    if !version.starts_with("HTTP/") {
-        return fail(
-            writer,
-            method,
-            &path,
-            "400 Bad Request",
-            "bad request\n",
-            VARY_ENCODING,
-            head_only,
-        );
-    }
-    let Some(version) = parse_version(version) else {
-        return fail(
-            writer,
-            method,
-            &path,
-            "505 HTTP Version Not Supported",
-            "http version not supported\n",
-            VARY_ENCODING,
-            head_only,
-        );
+    let version = match parse_version(version) {
+        ParsedVersion::Supported(version) => version,
+        ParsedVersion::Unsupported => {
+            return fail(
+                writer,
+                method,
+                &path,
+                "505 HTTP Version Not Supported",
+                "http version not supported\n",
+                VARY_ENCODING,
+                head_only,
+            );
+        }
+        ParsedVersion::Malformed => {
+            return fail(
+                writer,
+                method,
+                &path,
+                "400 Bad Request",
+                "bad request\n",
+                VARY_ENCODING,
+                head_only,
+            );
+        }
     };
 
     // Read headers until the blank line that ends the header block.
@@ -855,15 +875,16 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
         );
     }
 
-    match header(&headers, "expect") {
+    match expects_continue(&headers) {
         // An HTTP/1.0 client cannot understand 1xx; ignore the expectation
-        // (RFC 7231 5.1.1) and read the body as usual.
-        Some(value) if version == Version::Http11 && value.eq_ignore_ascii_case("100-continue") => {
+        // (RFC 9110 10.1.1) and read the body as usual.
+        Some(true) if version == Version::Http11 => {
             writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
             writer.flush()?;
         }
-        Some(value) if value.eq_ignore_ascii_case("100-continue") => {}
-        Some(_) => {
+        Some(true) => {}
+        // A member other than 100-continue MAY be answered 417 (RFC 9110 10.1.1).
+        Some(false) => {
             return fail(
                 writer,
                 method,
@@ -1069,19 +1090,38 @@ fn greeting(
     }
 }
 
-/// First value of the named (lowercase) header, if present.
-fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.as_str())
+/// Whether the request carries a `100-continue` expectation.
+///
+/// The `Expect` field value is a list of expectations (RFC 9110 10.1.1), and
+/// multiple field lines with the same name are combined in order (RFC 9110 5.3);
+/// empty list elements are ignored (RFC 9110 5.6.1). The only expectation this
+/// server recognizes is `100-continue` (ASCII case-insensitive), so the value is
+/// recognized iff every member is `100-continue`. Returns `None` when the field is
+/// absent or carries no member, `Some(true)` when every member is `100-continue`,
+/// and `Some(false)` when a member is not.
+fn expects_continue(headers: &[(String, String)]) -> Option<bool> {
+    let mut present = false;
+    let mut recognized = true;
+    for (_, value) in headers.iter().filter(|(name, _)| name == "expect") {
+        for element in value.split(',') {
+            let element = element.trim();
+            if element.is_empty() {
+                continue;
+            }
+            present = true;
+            if !element.eq_ignore_ascii_case("100-continue") {
+                recognized = false;
+            }
+        }
+    }
+    present.then_some(recognized)
 }
 
 /// Join every value of the named (lowercase) header in order with `", "`.
 ///
 /// Multiple field lines with the same name are equivalent to one comma-separated
 /// list (RFC 9110 5.3), so callers that need the whole list use this instead of
-/// [`header`]. Returns `None` when the header is absent.
+/// a first-value lookup. Returns `None` when the header is absent.
 fn combined_header(headers: &[(String, String)], name: &str) -> Option<String> {
     let mut joined: Option<String> = None;
     for (key, value) in headers {
@@ -1104,6 +1144,49 @@ fn is_token(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// Whether `target` begins with a URI `scheme ":"` (RFC 3986 3.1).
+fn has_scheme(target: &str) -> bool {
+    let Some((scheme, _)) = target.split_once(':') else {
+        return false;
+    };
+    scheme
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+}
+
+/// Whether `target` is an `authority-form` target: `uri-host ":" port` (RFC 9112 3.2.3).
+fn authority_form_is_valid(target: &str) -> bool {
+    match target.rsplit_once(':') {
+        Some((host, port)) => {
+            port.bytes().all(|b| b.is_ascii_digit())
+                && authority_is_valid(&format!("{host}:{port}"))
+        }
+        None => false,
+    }
+}
+
+/// Whether `target` matches one of the four `request-target` forms (RFC 9112 3.2).
+///
+/// A `CONNECT` request's target is `authority-form`, `uri-host ":" port`, and is
+/// validated as such (RFC 9112 3.2.3). Otherwise `origin-form` is an absolute
+/// path, so a target that starts with `/` is valid (`?` is also accepted, keeping
+/// the documented empty-path leniency of RFC 3986 6.2.3), and `absolute-form` is a
+/// URI with a scheme, so any target that begins with a `scheme ":"` is valid.
+/// `asterisk-form` is `*` and is only valid for a server-wide `OPTIONS` request.
+fn target_is_valid(method: &str, target: &str) -> bool {
+    if method == "CONNECT" {
+        return authority_form_is_valid(target);
+    }
+    if target == "*" {
+        return method == "OPTIONS";
+    }
+    target.starts_with(['/', '?']) || has_scheme(target)
 }
 
 /// Strip an absolute-form request target down to its origin-form path.
@@ -1142,7 +1225,7 @@ fn request_path(target: &str) -> &str {
 }
 
 /// HTTP version of a request, after folding higher `1.x` minors to 1.1.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Version {
     /// HTTP/1.0.
     Http10,
@@ -1150,20 +1233,46 @@ enum Version {
     Http11,
 }
 
+/// Outcome of parsing a request's HTTP version token.
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedVersion {
+    /// A version this server supports.
+    Supported(Version),
+    /// A well-formed token whose major version this server does not support.
+    Unsupported,
+    /// A token that is not `HTTP/` + major + `.` + minor.
+    Malformed,
+}
+
 /// Parse a request's HTTP version token.
 ///
-/// A higher `HTTP/1.x` minor version is processed as 1.1 (RFC 7230 2.6); a
-/// different major version is unsupported.
-fn parse_version(version: &str) -> Option<Version> {
-    match version {
-        "HTTP/1.0" => Some(Version::Http10),
-        _ => {
-            let minor = version.strip_prefix("HTTP/1.")?;
-            if minor.is_empty() || !minor.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            Some(Version::Http11)
-        }
+/// The grammar is `HTTP-version = HTTP-name "/" DIGIT "." DIGIT` (RFC 9112 2.3),
+/// so the token must be `HTTP/`, a non-empty run of digits, `.`, and another
+/// non-empty run of digits. A token whose major version is not `1` is
+/// [`ParsedVersion::Unsupported`]; a token that does not match the grammar is
+/// [`ParsedVersion::Malformed`]. A higher `1.x` minor version is processed as
+/// 1.1 (RFC 7230 2.6).
+fn parse_version(version: &str) -> ParsedVersion {
+    let Some(rest) = version.strip_prefix("HTTP/") else {
+        return ParsedVersion::Malformed;
+    };
+    let Some((major, minor)) = rest.split_once('.') else {
+        return ParsedVersion::Malformed;
+    };
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.bytes().all(|b| b.is_ascii_digit())
+        || !minor.bytes().all(|b| b.is_ascii_digit())
+    {
+        return ParsedVersion::Malformed;
+    }
+    match major {
+        "1" => ParsedVersion::Supported(if minor == "0" {
+            Version::Http10
+        } else {
+            Version::Http11
+        }),
+        _ => ParsedVersion::Unsupported,
     }
 }
 
@@ -2729,5 +2838,162 @@ mod tests {
         assert_eq!(info.status, "200 OK");
         assert_eq!(info.path, "/");
         assert_eq!(body(&response), "Hello, World!\n");
+    }
+
+    #[test]
+    fn expect_list_members_are_combined() {
+        // A member other than 100-continue is answered 417 wherever it appears.
+        for request in [
+            "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue, nope\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: nope, 100-continue\r\n\r\n",
+        ] {
+            let (_, info) = run(request, &default_config());
+            assert_eq!(
+                info.expect("served").status,
+                "417 Expectation Failed",
+                "was {request:?}"
+            );
+        }
+
+        // Duplicate members and duplicate field lines are both recognized.
+        for request in [
+            "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue, 100-continue\r\nContent-Length: 5\r\n\r\nhello",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nExpect: 100-CONTINUE\r\nContent-Length: 5\r\n\r\nhello",
+        ] {
+            let (response, info) = run(request, &default_config());
+            assert_eq!(info.expect("served").status, "200 OK", "was {request:?}");
+            let final_response = response
+                .strip_prefix("HTTP/1.1 100 Continue\r\n\r\n")
+                .unwrap_or_else(|| panic!("response was {response:?}"));
+            assert_eq!(body(final_response), "Hello, World!\n");
+        }
+
+        // A field with no member is ignored, so no 100 Continue is sent.
+        for request in [
+            "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: ,\r\nContent-Length: 0\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: \r\n\r\n",
+        ] {
+            let (response, info) = run(request, &default_config());
+            assert_eq!(info.expect("served").status, "200 OK", "was {request:?}");
+            assert!(
+                !response.starts_with("HTTP/1.1 100 Continue"),
+                "response was {response:?}"
+            );
+        }
+
+        // An HTTP/1.0 client gets the 417 but never the interim response.
+        let (_, info) = run(
+            "GET / HTTP/1.0\r\nExpect: 100-continue, nope\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "417 Expectation Failed");
+    }
+
+    #[test]
+    fn malformed_version_tokens_are_bad_request() {
+        for version in [
+            "HTTP/1.",
+            "HTTP/1.x",
+            "HTTP/1",
+            "HTTP/",
+            "HTTP/x.1",
+            "HTTP/1.1.1",
+        ] {
+            let request = format!("GET / {version}\r\nHost: localhost\r\n\r\n");
+            let (_, info) = run(&request, &default_config());
+            assert_eq!(
+                info.expect("served").status,
+                "400 Bad Request",
+                "was {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_major_versions_are_505() {
+        for version in ["HTTP/2.0", "HTTP/9.9", "HTTP/0.9"] {
+            let request = format!("GET / {version}\r\nHost: localhost\r\n\r\n");
+            let (_, info) = run(&request, &default_config());
+            assert_eq!(
+                info.expect("served").status,
+                "505 HTTP Version Not Supported",
+                "was {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_request_targets_are_bad_request() {
+        for request in [
+            "GET foo HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET foo/bar HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "CONNECT foo HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "CONNECT foo:bar HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ] {
+            let (_, info) = run(request, &default_config());
+            assert_eq!(
+                info.expect("served").status,
+                "400 Bad Request",
+                "was {request:?}"
+            );
+        }
+
+        // A valid authority-form target is routed as a `CONNECT` request.
+        for target in ["example.com:443", "[::1]:443"] {
+            let request = format!("CONNECT {target} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let (response, info) = run(&request, &default_config());
+            let info = info.expect("served");
+            assert_eq!(info.status, "405 Method Not Allowed", "was {target:?}");
+            assert_eq!(header_value(&response, "Allow"), Some("GET, HEAD"));
+        }
+    }
+
+    #[test]
+    fn over_long_method_is_not_implemented() {
+        let method = "A".repeat(9000);
+        let request = format!("{method}\r\n");
+        let (response, info) = run(&request, &default_config());
+        let info = info.expect("served");
+        assert_eq!(info.status, "501 Not Implemented");
+        assert_eq!(info.method, method);
+        assert_eq!(info.path, "-");
+        assert_eq!(body(&response), "not implemented\n");
+    }
+
+    #[test]
+    fn parse_version_classifies_tokens() {
+        assert_eq!(
+            parse_version("HTTP/1.0"),
+            ParsedVersion::Supported(Version::Http10)
+        );
+        assert_eq!(
+            parse_version("HTTP/1.1"),
+            ParsedVersion::Supported(Version::Http11)
+        );
+        assert_eq!(
+            parse_version("HTTP/1.10"),
+            ParsedVersion::Supported(Version::Http11)
+        );
+        assert_eq!(parse_version("HTTP/2.0"), ParsedVersion::Unsupported);
+        assert_eq!(parse_version("HTTP/1."), ParsedVersion::Malformed);
+        assert_eq!(parse_version("FOO"), ParsedVersion::Malformed);
+    }
+
+    #[test]
+    fn request_target_forms_are_validated() {
+        assert!(target_is_valid("OPTIONS", "*"));
+        assert!(!target_is_valid("GET", "*"));
+        assert!(target_is_valid("GET", "/a?b"));
+        assert!(target_is_valid("GET", "?q=1"));
+        assert!(target_is_valid("GET", "http://host/x"));
+        assert!(target_is_valid("GET", "foo:bar"));
+        assert!(!target_is_valid("GET", "host"));
+        assert!(!target_is_valid("GET", "foo/bar"));
+        assert!(target_is_valid("CONNECT", "host:443"));
+        assert!(target_is_valid("CONNECT", "[::1]:443"));
+        assert!(!target_is_valid("CONNECT", "host"));
+        assert!(!target_is_valid("CONNECT", "host:port"));
+        assert!(!target_is_valid("CONNECT", "/path"));
     }
 }
