@@ -31,6 +31,9 @@ const MAX_HEADERS: usize = 100;
 /// Largest request body that is drained before the request is rejected.
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
+/// Largest accepted chunk-size line, including any chunk extensions.
+const MAX_CHUNK_LINE: usize = 1024;
+
 /// Largest number of connections served concurrently.
 const MAX_CONNECTIONS: usize = 256;
 
@@ -539,21 +542,100 @@ fn timeout_or(err: io::Error, info: RequestInfo) -> Result<Option<RequestInfo>, 
     }
 }
 
-/// The framing error a request's `Transfer-Encoding` field(s) carry, if any.
+/// How a request body is framed (RFC 9112 6.3).
+enum Framing {
+    /// `Content-Length` gives the body length in octets.
+    Length(u64),
+    /// The chunked transfer coding delimits the body (RFC 9112 7.1).
+    Chunked,
+}
+
+/// How draining a chunked body failed.
+#[derive(Debug)]
+enum ChunkError {
+    /// The body did not arrive before the deadline.
+    TimedOut,
+    /// The chunked framing is malformed or over a limit.
+    Malformed,
+    /// The decoded content exceeds `MAX_BODY`.
+    TooLarge,
+    /// The connection failed while reading the body.
+    Io(io::Error),
+}
+
+/// Compare two chunk errors by kind, so the unit tests can assert on them.
 ///
-/// A message with a `Transfer-Encoding` is framed by its final transfer coding
-/// (RFC 9112 6.3 rule 4), and this server decodes none (RFC 9112 6.1): a final
-/// `chunked` coding is answered with `501 Not Implemented`, while any other
-/// final coding — or no coding at all — leaves the body length undeterminable and
-/// is answered with `400 Bad Request`. An HTTP/1.0 message with a
-/// `Transfer-Encoding` has faulty framing whatever the coding (RFC 9112 6.1), so it
-/// is answered with `400 Bad Request` as well. Returns the status and body of the
-/// error, or `None` when the field is absent.
-fn transfer_encoding_failure(
+/// `io::Error` is not `PartialEq`, so the [`ChunkError::Io`] arm compares the
+/// error kind instead; two IO errors of the same kind are treated as equal. Only
+/// the tests compare errors, so the impl is compiled with them.
+#[cfg(test)]
+impl PartialEq for ChunkError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ChunkError::TimedOut, ChunkError::TimedOut)
+            | (ChunkError::Malformed, ChunkError::Malformed)
+            | (ChunkError::TooLarge, ChunkError::TooLarge) => true,
+            (ChunkError::Io(left), ChunkError::Io(right)) => left.kind() == right.kind(),
+            _ => false,
+        }
+    }
+}
+
+/// Classify a socket error while draining a chunked body.
+///
+/// A read that timed out (or would have blocked) is the request deadline
+/// ([`ChunkError::TimedOut`]); every other error is a connection failure
+/// ([`ChunkError::Io`]).
+impl From<io::Error> for ChunkError {
+    fn from(err: io::Error) -> Self {
+        match err.kind() {
+            ErrorKind::TimedOut | ErrorKind::WouldBlock => ChunkError::TimedOut,
+            _ => ChunkError::Io(err),
+        }
+    }
+}
+
+/// Split one header or trailer field line into its name and value.
+///
+/// The line is `field-name ":" OWS field-value OWS` (RFC 9110 5.1, 5.5): the name
+/// must be a `token` (RFC 9110 5.6.2), so a name with whitespace before the colon
+/// — including the leading SP or HTAB of an obsolete folded line (RFC 7230 3.2.4) —
+/// fails here; the value is VCHAR / obs-text, so a control character other than
+/// HTAB is malformed (RFC 9110 5.5). Returns the lowercased name with its OWS
+/// stripped value, or `None` when the line is not a well-formed field. Field names
+/// are matched case-insensitively (RFC 9110 5.1).
+fn field_line(line: &str) -> Option<(String, String)> {
+    let (name, value) = line.split_once(':')?;
+    if !is_token(name) {
+        return None;
+    }
+    if value.bytes().any(|b| b.is_ascii_control() && b != b'\t') {
+        return None;
+    }
+    Some((name.to_ascii_lowercase(), trim_ows(value).to_string()))
+}
+
+/// Frame the request body from its `Transfer-Encoding` and `Content-Length` fields.
+///
+/// Without a `Transfer-Encoding`, the body length comes from
+/// [`content_length`] (RFC 9112 6.3 rule 6), and a length above `MAX_BODY` is a
+/// `413 Content Too Large`. With a `Transfer-Encoding`, the body is framed by the
+/// coding (RFC 9112 6.3 rule 4): an HTTP/1.0 message carrying one has faulty
+/// framing whatever the coding (RFC 9112 6.1) and a coding that defines parameters
+/// (RFC 9112 7.1, 7.2) is an error, both `400 Bad Request`; a `Content-Length`
+/// beside it is ambiguous (RFC 9112 6.3 rule 3, 6.1) and is also
+/// `400 Bad Request`; a final coding that is not `chunked` leaves the length
+/// undeterminable (rule 4 MUST), so it too is `400 Bad Request`; a coding the
+/// server does not decode — any non-`chunked` element (RFC 9112 6.1 SHOULD) — is
+/// `501 Not Implemented`; and otherwise the chunked coding is decoded. Returns the
+/// framing, or the status and body of the error.
+fn body_framing(
     version: Version,
     headers: &[(String, String)],
-) -> Option<(&'static str, &'static str)> {
+) -> Result<Framing, (&'static str, &'static str)> {
     let mut present = false;
+    let mut parameters = false;
+    let mut all_chunked = true;
     let mut final_coding: Option<&str> = None;
     for (_, value) in headers
         .iter()
@@ -561,21 +643,177 @@ fn transfer_encoding_failure(
     {
         present = true;
         for element in value.split(',') {
-            let coding = trim_ows(element.split(';').next().unwrap_or(""));
-            if !coding.is_empty() {
-                final_coding = Some(coding);
+            let element = trim_ows(element);
+            if element.is_empty() {
+                continue;
+            }
+            let (coding, has_parameters) = match element.split_once(';') {
+                Some((coding, _)) => (trim_ows(coding), true),
+                None => (element, false),
+            };
+            if coding.is_empty() {
+                return Err(("400 Bad Request", "bad request\n"));
+            }
+            parameters |= has_parameters;
+            final_coding = Some(coding);
+            if !coding.eq_ignore_ascii_case("chunked") {
+                all_chunked = false;
             }
         }
     }
     if !present {
-        return None;
+        let length = content_length(headers)?;
+        if length > MAX_BODY as u64 {
+            return Err(("413 Content Too Large", "payload too large\n"));
+        }
+        return Ok(Framing::Length(length));
     }
-    if version == Version::Http11
-        && final_coding.is_some_and(|coding| coding.eq_ignore_ascii_case("chunked"))
-    {
-        return Some(("501 Not Implemented", "not implemented\n"));
+    if version == Version::Http10 {
+        return Err(("400 Bad Request", "bad request\n"));
     }
-    Some(("400 Bad Request", "bad request\n"))
+    if parameters {
+        return Err(("400 Bad Request", "bad request\n"));
+    }
+    if headers.iter().any(|(name, _)| name == "content-length") {
+        return Err(("400 Bad Request", "bad request\n"));
+    }
+    match final_coding {
+        Some(coding) if coding.eq_ignore_ascii_case("chunked") => {}
+        _ => return Err(("400 Bad Request", "bad request\n")),
+    }
+    if !all_chunked {
+        return Err(("501 Not Implemented", "not implemented\n"));
+    }
+    Ok(Framing::Chunked)
+}
+
+/// Parse one `chunk-size` line's size (RFC 9112 7.1).
+///
+/// `chunk-size = 1*HEXDIG`; the size is the text before the first `';'` of a chunk
+/// extension, trimmed of OWS, and must be a non-empty run of ASCII hex digits. The
+/// value is accumulated with checked arithmetic, since a recipient must anticipate
+/// large hexadecimal numerals and prevent parsing errors due to integer conversion
+/// overflows (RFC 9112 7.1); an empty or non-hexadecimal size is
+/// [`ChunkError::Malformed`] and an overflow is [`ChunkError::TooLarge`]. A run of
+/// zeros is the last chunk, so it yields `0`.
+fn chunk_size(line: &str) -> Result<u64, ChunkError> {
+    let size = trim_ows(line.split(';').next().unwrap_or(""));
+    if size.is_empty() || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ChunkError::Malformed);
+    }
+    let mut value = 0_u64;
+    for byte in size.bytes() {
+        let nibble = (byte as char).to_digit(16).ok_or(ChunkError::Malformed)? as u64;
+        value = value
+            .checked_mul(16)
+            .and_then(|value| value.checked_add(nibble))
+            .ok_or(ChunkError::TooLarge)?;
+    }
+    Ok(value)
+}
+
+/// Read and discard a chunked body, returning its decoded length (RFC 9112 7.1).
+///
+/// The body is `*( chunk-size [ chunk-ext ] CRLF chunk-data CRLF ) last-chunk
+/// trailer-section CRLF`, so each chunk-size line is parsed by [`chunk_size`], its
+/// data drained by [`drain_octets`], and the CRLF that follows the data accepted as
+/// an empty line — with the bare-LF leniency of RFC 9112 2.2. A body that ends
+/// before the last chunk, or a size line over `MAX_CHUNK_LINE`, is
+/// [`ChunkError::Malformed`]; a size that would push the decoded content past
+/// `MAX_BODY` is [`ChunkError::TooLarge`], checked before the data is read so a
+/// huge size cannot stream. `buf` is the caller's line buffer and `scratch` the
+/// caller's drain buffer, so no allocation happens per chunk.
+fn drain_chunked<R: BufRead, D: Deadline>(
+    reader: &mut R,
+    deadline: &mut D,
+    buf: &mut Vec<u8>,
+    scratch: &mut [u8],
+) -> Result<u64, ChunkError> {
+    let mut total = 0_u64;
+    loop {
+        match read_line(reader, MAX_CHUNK_LINE, buf, deadline)? {
+            ReadLine::Line { text, .. } => match chunk_size(&text)? {
+                0 => {
+                    drain_trailers(reader, deadline, buf)?;
+                    return Ok(total);
+                }
+                size => {
+                    total = total.checked_add(size).ok_or(ChunkError::TooLarge)?;
+                    if total > MAX_BODY as u64 {
+                        return Err(ChunkError::TooLarge);
+                    }
+                    drain_octets(reader, deadline, scratch, size)?;
+                    // The CRLF (or bare LF) after the chunk data (RFC 9112 7.1
+                    // `chunk = chunk-size [ chunk-ext ] CRLF chunk-data CRLF`).
+                    match read_line(reader, 0, buf, deadline)? {
+                        ReadLine::Line { text, .. } if text.is_empty() => {}
+                        _ => return Err(ChunkError::Malformed),
+                    }
+                }
+            },
+            ReadLine::Eof | ReadLine::TooLong => return Err(ChunkError::Malformed),
+        }
+    }
+}
+
+/// Drain `count` octets of chunk data, re-arming the deadline before each read.
+///
+/// The body ended early when the reader reports EOF before `count` octets arrived
+/// ([`ChunkError::Malformed`]); `scratch` is the caller's buffer, so a chunk is
+/// discarded without allocating.
+fn drain_octets<R: BufRead, D: Deadline>(
+    reader: &mut R,
+    deadline: &mut D,
+    scratch: &mut [u8],
+    count: u64,
+) -> Result<(), ChunkError> {
+    let mut remaining = count;
+    while remaining > 0 {
+        deadline.arm()?;
+        let read = (&mut *reader)
+            .take(remaining)
+            .read(scratch)
+            .map_err(ChunkError::from)?;
+        if read == 0 {
+            return Err(ChunkError::Malformed);
+        }
+        remaining -= read as u64;
+    }
+    Ok(())
+}
+
+/// Read and discard the `trailer-section` that ends a chunked body (RFC 9112 7.1.2).
+///
+/// The section is `*( field-line CRLF )` terminated by an empty line, bounded by the
+/// same `MAX_HEADER_BYTES` and `MAX_HEADERS` limits as the header section (an
+/// over-long section is an appropriate 4xx, RFC 9110 6.5, 5.4). The trailer fields
+/// are discarded, which RFC 9110 6.5 permits; merging fields the server does not
+/// know into the header section is forbidden, so they are never returned.
+fn drain_trailers<R: BufRead, D: Deadline>(
+    reader: &mut R,
+    deadline: &mut D,
+    buf: &mut Vec<u8>,
+) -> Result<(), ChunkError> {
+    let mut bytes = 0_usize;
+    let mut fields = 0_usize;
+    loop {
+        match read_line(reader, MAX_HEADER_LINE, buf, deadline)? {
+            ReadLine::Eof | ReadLine::TooLong => return Err(ChunkError::Malformed),
+            ReadLine::Line { text, wire } => {
+                if text.is_empty() {
+                    return Ok(());
+                }
+                bytes += wire;
+                if bytes > MAX_HEADER_BYTES || fields >= MAX_HEADERS {
+                    return Err(ChunkError::Malformed);
+                }
+                if field_line(&text).is_none() {
+                    return Err(ChunkError::Malformed);
+                }
+                fields += 1;
+            }
+        }
+    }
 }
 
 /// Frame the request body from its `Content-Length` field(s).
@@ -796,19 +1034,9 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                     );
                 }
                 // An obsolete folded line starts with SP or HTAB (RFC 7230
-                // 3.2.4); reject it instead of misreading it as a field.
-                if line.starts_with([' ', '\t']) {
-                    return fail(
-                        writer,
-                        method,
-                        &path,
-                        "400 Bad Request",
-                        "bad request\n",
-                        VARY_ENCODING,
-                        head_only,
-                    );
-                }
-                let Some((name, value)) = line.split_once(':') else {
+                // 3.2.4); that whitespace is not a `token` character, so
+                // `field_line` rejects the folded line instead of misreading it.
+                let Some((name, value)) = field_line(&line) else {
                     return fail(
                         writer,
                         method,
@@ -819,33 +1047,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                         head_only,
                     );
                 };
-                // No whitespace is allowed before the colon, and the field name
-                // must be a token (RFC 7230 3.2.4, 3.2.6).
-                if !is_token(name) {
-                    return fail(
-                        writer,
-                        method,
-                        &path,
-                        "400 Bad Request",
-                        "bad request\n",
-                        VARY_ENCODING,
-                        head_only,
-                    );
-                }
-                // Field values are VCHAR / obs-text: control characters other
-                // than HTAB are malformed.
-                if value.bytes().any(|b| b.is_ascii_control() && b != b'\t') {
-                    return fail(
-                        writer,
-                        method,
-                        &path,
-                        "400 Bad Request",
-                        "bad request\n",
-                        VARY_ENCODING,
-                        head_only,
-                    );
-                }
-                headers.push((name.to_ascii_lowercase(), trim_ows(value).to_string()));
+                headers.push((name, value));
             }
         }
     }
@@ -864,26 +1066,11 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
         );
     }
 
-    // The body is framed by the transfer coding when one is present; this
-    // server decodes none, so the framing decides the error (RFC 9112 6.1,
-    // 6.3 rule 4).
-    if let Some((status, body)) = transfer_encoding_failure(version, &headers) {
-        return fail(
-            writer,
-            method,
-            &path,
-            status,
-            body,
-            VARY_ENCODING,
-            head_only,
-        );
-    }
-
-    // Without Transfer-Encoding, Content-Length frames the body; an invalid
-    // field is an unrecoverable framing error unless it is a comma-separated
-    // list of the same value (RFC 9112 6.3 rule 5).
-    let content_length = match content_length(&headers) {
-        Ok(length) => length,
+    // The body is framed by the transfer coding when one is present, and by
+    // Content-Length otherwise (RFC 9112 6.1, 6.3); an invalid or ambiguous
+    // framing is answered from here.
+    let framing = match body_framing(version, &headers) {
+        Ok(framing) => framing,
         Err((status, body)) => {
             return fail(
                 writer,
@@ -896,17 +1083,6 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             );
         }
     };
-    if content_length > MAX_BODY as u64 {
-        return fail(
-            writer,
-            method,
-            &path,
-            "413 Content Too Large",
-            "payload too large\n",
-            VARY_ENCODING,
-            head_only,
-        );
-    }
 
     // The response carries no content coding, so a client that refuses
     // `identity` has no acceptable representation (RFC 9110 12.5.3). Reject
@@ -946,35 +1122,73 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
         None => {}
     }
 
-    // Drain the body, re-arming the deadline before every chunk so a client
+    // Drain the body, re-arming the deadline before every read so a client
     // that trickles the body cannot hold the connection open.
-    let mut remaining = content_length;
     let mut scratch = [0_u8; 8192];
-    while remaining > 0 {
-        if let Err(err) = deadline.arm() {
-            return timeout_or(err, RequestInfo::new(method, &path, "-", TIMEOUT_STATUS));
-        }
-        let read = match (&mut *reader).take(remaining).read(&mut scratch) {
-            Ok(read) => read,
-            Err(err) => {
-                return timeout_or(err, RequestInfo::new(method, &path, "-", TIMEOUT_STATUS));
+    match framing {
+        Framing::Length(mut remaining) => {
+            while remaining > 0 {
+                if let Err(err) = deadline.arm() {
+                    return timeout_or(err, RequestInfo::new(method, &path, "-", TIMEOUT_STATUS));
+                }
+                let read = match (&mut *reader).take(remaining).read(&mut scratch) {
+                    Ok(read) => read,
+                    Err(err) => {
+                        return timeout_or(
+                            err,
+                            RequestInfo::new(method, &path, "-", TIMEOUT_STATUS),
+                        );
+                    }
+                };
+                if read == 0 {
+                    break;
+                }
+                remaining -= read as u64;
             }
-        };
-        if read == 0 {
-            break;
+            if remaining != 0 {
+                return fail(
+                    writer,
+                    method,
+                    &path,
+                    "400 Bad Request",
+                    "bad request\n",
+                    VARY_ENCODING,
+                    head_only,
+                );
+            }
         }
-        remaining -= read as u64;
-    }
-    if remaining != 0 {
-        return fail(
-            writer,
-            method,
-            &path,
-            "400 Bad Request",
-            "bad request\n",
-            VARY_ENCODING,
-            head_only,
-        );
+        Framing::Chunked => match drain_chunked(&mut *reader, deadline, &mut buf, &mut scratch) {
+            Ok(_) => {}
+            Err(ChunkError::TimedOut) => {
+                return timeout_or(
+                    io::Error::new(ErrorKind::TimedOut, "body deadline exceeded"),
+                    RequestInfo::new(method, &path, "-", TIMEOUT_STATUS),
+                );
+            }
+            Err(ChunkError::Malformed) => {
+                return fail(
+                    writer,
+                    method,
+                    &path,
+                    "400 Bad Request",
+                    "bad request\n",
+                    VARY_ENCODING,
+                    head_only,
+                );
+            }
+            Err(ChunkError::TooLarge) => {
+                return fail(
+                    writer,
+                    method,
+                    &path,
+                    "413 Content Too Large",
+                    "payload too large\n",
+                    VARY_ENCODING,
+                    head_only,
+                );
+            }
+            Err(ChunkError::Io(err)) => return Err(Failure::Io(err)),
+        },
     }
 
     let (status, lang, body, extra, vary): (
@@ -1244,11 +1458,16 @@ fn has_scheme(target: &str) -> bool {
 }
 
 /// Whether `target` is an `authority-form` target: `uri-host ":" port` (RFC 9112 3.2.3).
+///
+/// The port is mandatory and non-empty, and must be a decimal number that fits a
+/// `u16`: a server must reject a `CONNECT` request whose port is empty or invalid
+/// (RFC 9110 9.3.6), and the host must be non-empty for the authority to name
+/// anything. The `host:port` pair must also satisfy [`authority_is_valid`], so an
+/// IP-literal host keeps its bracketed form.
 fn authority_form_is_valid(target: &str) -> bool {
     match target.rsplit_once(':') {
         Some((host, port)) => {
-            port.bytes().all(|b| b.is_ascii_digit())
-                && authority_is_valid(&format!("{host}:{port}"))
+            !host.is_empty() && port.parse::<u16>().is_ok() && authority_is_valid(target)
         }
         None => false,
     }
@@ -1323,13 +1542,53 @@ fn origin_form_is_valid(target: &str) -> bool {
 /// The grammar is `absolute-URI = scheme ":" hier-part [ "?" query ]`
 /// (RFC 3986 4.3), which has no fragment, so a `#`, a non-ASCII byte or a
 /// malformed percent-escape makes the request-line invalid. The `[` and `]` of an
-/// IP-literal host are accepted in the authority component.
+/// IP-literal host are accepted in the authority component. For the `http` and
+/// `https` schemes the stricter `http-URI = "http" "://" authority path-abempty
+/// [ "?" query ]` (RFC 9110 4.2.1) applies: the authority must be introduced
+/// by `//`, must satisfy [`authority_is_valid`] — which rejects userinfo (RFC 9110
+/// 4.2.4) and a malformed percent-escape — and must not have an empty host, since
+/// a sender must not generate an `http` URI with an empty host identifier and a
+/// recipient must reject such a URI as invalid. An empty port stays valid, as it
+/// normalizes to the scheme's default (RFC 9110 4.2.3). Any other scheme keeps
+/// the generic absolute-URI handling.
 fn absolute_form_is_valid(target: &str) -> bool {
-    has_scheme(target)
+    let generic = has_scheme(target)
         && target
             .bytes()
             .all(|byte| is_query(byte) || matches!(byte, b'[' | b']'))
-        && pct_escapes_are_valid(target)
+        && pct_escapes_are_valid(target);
+    if !generic {
+        return false;
+    }
+    let Some((scheme, rest)) = split_scheme(target) else {
+        return false;
+    };
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+        return true;
+    }
+    let Some(authority_and_path) = rest.strip_prefix("//") else {
+        return false;
+    };
+    let end = authority_and_path
+        .find(['/', '?'])
+        .unwrap_or(authority_and_path.len());
+    let authority = &authority_and_path[..end];
+    authority_is_valid(authority) && !authority_host_is_empty(authority)
+}
+
+/// Whether the host of an `authority` component is empty (RFC 9110 4.2.1).
+///
+/// An IP-literal is bracketed, so it always names a host; otherwise an optional
+/// trailing `:port` whose port is all digits is stripped, and what remains is the
+/// host. This is what makes `http:///x` and `http://:80/x` invalid `http` URIs.
+fn authority_host_is_empty(authority: &str) -> bool {
+    if authority.starts_with('[') {
+        return false;
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host.is_empty(),
+        _ => authority.is_empty(),
+    }
 }
 
 /// Whether `target` matches one of the four `request-target` forms (RFC 9112 3.2).
@@ -2032,13 +2291,142 @@ mod tests {
     }
 
     #[test]
-    fn transfer_encoding_is_not_implemented() {
+    fn transfer_encoding_chunked_is_served() {
         let (response, info) = run(
-            "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "200 OK");
+        assert_eq!(body(&response), "Hello, World!\n");
+    }
+
+    #[test]
+    fn transfer_encoding_and_content_length_is_bad_request() {
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+        assert_eq!(body(&response), "bad request\n");
+    }
+
+    #[test]
+    fn unknown_transfer_coding_with_chunked_is_not_implemented() {
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
             &default_config(),
         );
         assert_eq!(info.expect("served").status, "501 Not Implemented");
         assert_eq!(body(&response), "not implemented\n");
+    }
+
+    #[test]
+    fn transfer_coding_parameters_are_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked;q=1\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn chunk_size_parses_hex_with_extensions() {
+        // `chunk-size = 1*HEXDIG` and a chunk extension follows a `";"`
+        // (RFC 9112 7.1); an overflow of the hexadecimal numeral is caught
+        // rather than wrapped (RFC 9112 7.1).
+        assert_eq!(chunk_size("5"), Ok(5));
+        assert_eq!(chunk_size("A"), Ok(10));
+        assert_eq!(chunk_size("0005"), Ok(5));
+        assert_eq!(chunk_size("5;x=1"), Ok(5));
+        assert_eq!(chunk_size("5 ; x = 1"), Ok(5));
+        assert_eq!(chunk_size("0"), Ok(0));
+        assert_eq!(chunk_size("z"), Err(ChunkError::Malformed));
+        assert_eq!(chunk_size(""), Err(ChunkError::Malformed));
+        assert_eq!(chunk_size(" "), Err(ChunkError::Malformed));
+        assert_eq!(chunk_size("0x5"), Err(ChunkError::Malformed));
+        assert_eq!(chunk_size("5g"), Err(ChunkError::Malformed));
+        assert_eq!(chunk_size("ffffffffffffffff"), Ok(u64::MAX));
+        let just_over = format!("1{}", "0".repeat(16));
+        assert_eq!(chunk_size(&just_over), Err(ChunkError::TooLarge));
+        assert_eq!(chunk_size("ffffffffffffffffff"), Err(ChunkError::TooLarge));
+    }
+
+    #[test]
+    fn chunked_body_is_drained() {
+        let request = "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(Cursor::new(request.as_bytes().to_vec()));
+        let mut writer = Vec::new();
+        let info = handle(&mut reader, &mut writer, &default_config(), &mut ())
+            .expect("handle must succeed")
+            .expect("served");
+        let response = String::from_utf8(writer).expect("response must be utf-8");
+        assert_eq!(info.status, "200 OK");
+        assert_eq!(body(&response), "Hello, World!\n");
+        // The whole body was consumed, so the connection is reusable.
+        assert!(reader.fill_buf().expect("fill").is_empty());
+    }
+
+    #[test]
+    fn chunked_body_ignores_extensions_and_trailers() {
+        // `chunked`, `chunked, chunked` and `,chunked,` all decode (RFC 9112
+        // 6.1); chunk extensions and the trailer section are parsed and
+        // discarded (RFC 9112 7.1, 7.1.2).
+        for coding in ["chunked", "chunked, chunked", ",chunked,"] {
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: {coding}\r\n\r\n5;x=1\r\nhello\r\n0;y\r\nX-Trailer: v\r\n\r\n"
+            );
+            let (response, info) = run(&request, &default_config());
+            assert_eq!(info.expect("served").status, "200 OK", "was {coding:?}");
+            assert_eq!(body(&response), "Hello, World!\n", "was {coding:?}");
+        }
+    }
+
+    #[test]
+    fn chunked_body_is_bounded() {
+        let status = |chunked: &str| {
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n{chunked}"
+            );
+            let (_, info) = run(&request, &default_config());
+            info.expect("served").status
+        };
+        // A chunk-size line that is not hexadecimal, data that ends early, a
+        // missing last chunk, and a bad CRLF after the data (RFC 9112 7.1).
+        assert_eq!(status("z\r\n"), "400 Bad Request");
+        assert_eq!(status("5\r\nhel"), "400 Bad Request");
+        assert_eq!(status("5\r\nhello\r\n"), "400 Bad Request");
+        assert_eq!(status("5\r\nhelloX"), "400 Bad Request");
+        // A chunk-size line over `MAX_CHUNK_LINE` (RFC 9112 7.1).
+        assert_eq!(
+            status(&format!("5;{}\r\n", "x".repeat(MAX_CHUNK_LINE))),
+            "400 Bad Request"
+        );
+        // A trailer line without a colon, and a trailer section over the header
+        // block limit (RFC 9112 7.1.2).
+        assert_eq!(status("0\r\nNoColon\r\n\r\n"), "400 Bad Request");
+        let trailer = format!("X: {}\r\n", "a".repeat(MAX_HEADER_LINE - 3)).repeat(9);
+        assert_eq!(status(&format!("0\r\n{trailer}\r\n")), "400 Bad Request");
+        // A chunk size, or a size whose sum, exceeds `MAX_BODY` (RFC 9112 7.1).
+        assert_eq!(status("1000001\r\n"), "413 Content Too Large");
+        assert_eq!(status("ffffffffffffffffff\r\n"), "413 Content Too Large");
+    }
+
+    #[test]
+    fn chunked_body_timeout_is_request_timeout() {
+        let request =
+            "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(Cursor::new(request.as_bytes().to_vec()));
+        // Six arms cover the request line, the three header lines and the first
+        // chunk, so the deadline expires inside the chunked body drain.
+        let (_, info) = run_deadline(
+            &mut reader,
+            &default_config(),
+            &mut CountdownDeadline { arms: 6 },
+        );
+        let info = info.expect("served");
+        assert_eq!(info.status, "408 Request Timeout");
+        assert_eq!(info.method, "GET");
+        assert_eq!(info.path, "/");
     }
 
     #[test]
@@ -3378,7 +3766,7 @@ mod tests {
         assert!(target_is_valid("GET", "?q=1"));
         assert!(target_is_valid("GET", "http://host/x"));
         assert!(target_is_valid("GET", "http://host"));
-        assert!(target_is_valid("GET", "http:/x"));
+        assert!(!target_is_valid("GET", "http:/x"));
         assert!(target_is_valid("GET", "ftp://host/x"));
         assert!(target_is_valid("GET", "foo:bar"));
         assert!(!target_is_valid("GET", "host"));
@@ -3392,6 +3780,51 @@ mod tests {
         assert!(!target_is_valid("CONNECT", "host"));
         assert!(!target_is_valid("CONNECT", "host:port"));
         assert!(!target_is_valid("CONNECT", "/path"));
+    }
+
+    #[test]
+    fn authority_form_requires_a_port() {
+        // `authority-form = uri-host ":" port` (RFC 9112 3.2.3), and a CONNECT
+        // request with an empty or invalid port must be rejected (RFC 9110 9.3.6).
+        assert!(target_is_valid("CONNECT", "host:443"));
+        assert!(target_is_valid("CONNECT", "host:0"));
+        assert!(target_is_valid("CONNECT", "host:65535"));
+        assert!(!target_is_valid("CONNECT", "host:"));
+        assert!(!target_is_valid("CONNECT", ":443"));
+        assert!(!target_is_valid("CONNECT", "host:99999"));
+        assert!(!target_is_valid("CONNECT", "host:port"));
+        assert!(!target_is_valid("CONNECT", "host"));
+        assert!(!target_is_valid("CONNECT", "/path"));
+    }
+
+    #[test]
+    fn http_absolute_form_requires_a_host() {
+        // `http-URI = "http" "://" authority path-abempty [ "?" query ]` and a
+        // sender must not generate an `http` URI with an empty host identifier
+        // (RFC 9110 4.2.1); userinfo is an error (RFC 9110 4.2.4).
+        for target in [
+            "http://host/x",
+            "http://host",
+            "http://host:/x",
+            "HTTP://HOST/x",
+            "https://host/x",
+            "ftp:///x",
+            "ftp:/x",
+            "foo:bar",
+        ] {
+            assert!(target_is_valid("GET", target), "was {target:?}");
+        }
+        for target in [
+            "http:///x",
+            "http://",
+            "http:/x",
+            "http://:80/x",
+            "http://user@host/x",
+            "http://[::1/x",
+            "http://%zz/",
+        ] {
+            assert!(!target_is_valid("GET", target), "was {target:?}");
+        }
     }
 
     #[test]

@@ -547,6 +547,136 @@ fn transfer_encoding_without_final_chunked_is_400() {
 }
 
 #[test]
+fn chunked_request_is_served() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(header(&response, "Content-Length"), Some("14"));
+    assert_eq!(body(&response), "Hello, World!\n");
+}
+
+#[test]
+fn chunked_request_ignores_extensions_and_trailers() {
+    let server = Server::start(&[]);
+
+    // Chunk extensions are ignored (RFC 9112 7.1.1).
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5;x=1\r\nhello\r\n0;y\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(body(&response), "Hello, World!\n");
+
+    // Trailer fields are read and discarded (RFC 9112 7.1.2).
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\nX-Trailer: v\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(body(&response), "Hello, World!\n");
+}
+
+#[test]
+fn malformed_chunked_body_is_400() {
+    let server = Server::start(&[]);
+
+    // A chunk-size that is not hexadecimal.
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nz\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+    assert_eq!(body(&response), "bad request\n");
+
+    // The body ends before the last chunk.
+    let response = request_half_close(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+
+    // The chunk data is cut short.
+    let response = request_half_close(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+
+    // The chunk data is not followed by a CRLF.
+    let response = request_half_close(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloX",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
+fn oversized_chunked_body_is_413() {
+    let server = Server::start(&[]);
+
+    // 0x1000001 is one octet over the 8 MiB body cap.
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1000001\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 413 Content Too Large");
+    assert_eq!(body(&response), "payload too large\n");
+
+    // A chunk-size that overflows u64 (RFC 9112 7.1).
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nffffffffffffffffff\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 413 Content Too Large");
+    assert_eq!(body(&response), "payload too large\n");
+}
+
+#[test]
+fn chunked_with_content_length_is_400() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+    assert_eq!(body(&response), "bad request\n");
+}
+
+#[test]
+fn unknown_transfer_coding_with_chunked_is_501() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 501 Not Implemented");
+    assert_eq!(body(&response), "not implemented\n");
+}
+
+#[test]
+fn chunked_transfer_coding_parameters_are_400() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked;q=1\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
+fn http10_with_chunked_transfer_encoding_is_400() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
 fn http11_without_host_is_400() {
     let server = Server::start(&[]);
     let response = request(server.port, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
@@ -615,6 +745,47 @@ fn invalid_request_target_is_400() {
     );
     assert_eq!(status(&response), "HTTP/1.1 405 Method Not Allowed");
     assert_eq!(header(&response, "Allow"), Some("GET, HEAD"));
+}
+
+#[test]
+fn connect_requires_a_valid_host_and_port() {
+    let server = Server::start(&[]);
+
+    // An empty port is rejected (RFC 9110 9.3.6).
+    let response = request(
+        server.port,
+        "CONNECT example.com: HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+
+    // An empty host is rejected (RFC 9110 4.2.1).
+    let response = request(
+        server.port,
+        "CONNECT :443 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+
+    // A port that does not fit u16 is rejected.
+    let response = request(
+        server.port,
+        "CONNECT example.com:99999 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+
+    // A well-formed authority-form CONNECT is routed like any other method.
+    let response = request(
+        server.port,
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 405 Method Not Allowed");
+    assert_eq!(header(&response, "Allow"), Some("GET, HEAD"));
+
+    // An IPv6 literal authority is still well formed.
+    let response = request(
+        server.port,
+        "CONNECT [::1]:443 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 405 Method Not Allowed");
 }
 
 #[test]
@@ -958,6 +1129,68 @@ fn absolute_form_is_routed_by_path_for_every_scheme() {
     );
     assert_eq!(status(&response), "HTTP/1.1 200 OK");
     assert_eq!(body(&response), "ok\n");
+}
+
+#[test]
+fn http_absolute_form_requires_a_host() {
+    let server = Server::start(&[]);
+
+    // An empty host identifier is rejected (RFC 9110 4.2.1).
+    for target in [
+        "http:///healthz",
+        "http://",
+        "http:/healthz",
+        "http://:80/healthz",
+    ] {
+        let response = request(
+            server.port,
+            &format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        );
+        assert_eq!(
+            status(&response),
+            "HTTP/1.1 400 Bad Request",
+            "target {target:?}"
+        );
+    }
+
+    // Userinfo is an error in an http URI (RFC 9110 4.2.4).
+    let response = request(
+        server.port,
+        "GET http://user@host/healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+
+    // An unbalanced IPv6 literal bracket is rejected.
+    let response = request(
+        server.port,
+        "GET http://[::1/x HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
+fn valid_absolute_forms_are_served() {
+    let server = Server::start(&[]);
+
+    // A bracketed host and an empty (defaulted) port stay valid.
+    for target in [
+        "http://[::1]/healthz",
+        "http://example.com:/healthz",
+        "http://localhost/",
+    ] {
+        let response = request(
+            server.port,
+            &format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        );
+        assert_eq!(status(&response), "HTTP/1.1 200 OK", "target {target:?}");
+    }
+
+    // A non-http scheme keeps the lenient generic absolute-URI handling.
+    let response = request(
+        server.port,
+        "GET ftp:///x HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 404 Not Found");
 }
 
 #[test]

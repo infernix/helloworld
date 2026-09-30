@@ -88,8 +88,14 @@ Requests that exceed the parser's limits are rejected with a short plain-text bo
 | Single header line longer than 8 KiB, headers larger than 64 KiB in total, or more than 100 fields | `431 Request Header Fields Too Large` |
 | Request body larger than 8 MiB, or a `Content-Length` above 8 MiB (checked before the body is read) | `413 Content Too Large` |
 | Body shorter than its `Content-Length` (EOF before the declared octets) | `400 Bad Request`                   |
-| A request whose final transfer coding is `chunked` (this server decodes no transfer coding) | `501 Not Implemented` |
-| A request whose final transfer coding is not `chunked`, or an HTTP/1.0 request carrying any `Transfer-Encoding` | `400 Bad Request` |
+| A `Transfer-Encoding: chunked` request body (decoded and discarded, so the request is served normally) | `200 OK` (or the route's own status) |
+| Malformed chunked body: a chunk-size that is not hexadecimal, a missing CRLF after the chunk data, a body that ends before the last chunk, or a trailer field that is not a field line | `400 Bad Request` |
+| Chunk-size line over 1 KiB (including chunk extensions), a trailer section over 64 KiB, or more than 100 trailer fields | `400 Bad Request` |
+| Decoded chunked body over 8 MiB, or a chunk-size that overflows 64 bits | `413 Content Too Large` |
+| A final transfer coding other than `chunked`, an HTTP/1.0 request carrying any `Transfer-Encoding`, a coding that carries a parameter, or a request carrying both `Transfer-Encoding` and `Content-Length` | `400 Bad Request` |
+| A coding list whose final coding is `chunked` but which names another coding (e.g. `gzip, chunked`) | `501 Not Implemented` |
+| An `http`/`https` absolute-form target with an empty host (`http:///healthz`, `http:/healthz`, `http://:80/x`) or a userinfo subcomponent (`http://user@host/x`) | `400 Bad Request` |
+| A `CONNECT` target with an empty host or an empty or invalid port (`CONNECT :443`, `CONNECT example.com:`, `CONNECT example.com:99999`) | `400 Bad Request` |
 | Version token that is not `HTTP/` followed by one digit, a `.`, and another digit (e.g. `HTTP/1.`, `HTTP/1.x`, `HTTP/1.10`) | `400 Bad Request` |
 | `HTTP` major version other than 1 (e.g. `HTTP/2.0`, `HTTP/9.9`) | `505 HTTP Version Not Supported`    |
 | Malformed request line, method, or a request target that matches none of the four request-target forms (origin-form, absolute-form, authority-form, asterisk-form; RFC 9112 3.2) | `400 Bad Request`                   |
@@ -112,7 +118,14 @@ treated as absent. An expectation is `token [ "=" ( token / quoted-string ) ] pa
 (RFC 9110 5.6.6), so parameters and a value on the token do not stop it being a `100-continue`
 expectation. Absolute-form request targets such as `GET http://example.com/ HTTP/1.1` are accepted
 (RFC 9112 3.2.2); routing and logging use the target URI's path (RFC 9112 3.3), so a target for any scheme
-(`ftp://example.com/healthz`, `http:/healthz`) is routed on its path component. A request target must be one
+(`ftp://example.com/healthz`, `ftp:///x`, `ftp:/x`) is routed on its path component. An `http` or `https`
+absolute-form target must carry a non-empty host (`http-URI = "http" "://" authority path-abempty [ "?" query ]`,
+RFC 9110 4.2.1), so `http:///healthz`, `http:/healthz` and `http://:80/x` are answered `400 Bad Request`
+(RFC 9110 4.2.1, 4.2.2), and a userinfo subcomponent is treated as an error, so `http://user@host/x` is
+answered `400 Bad Request` (RFC 9110 4.2.4); every other scheme keeps the generic absolute-URI handling
+(RFC 3986 4.3). A `CONNECT` target is `uri-host ":" port` (RFC 9112 3.2.3) and both the host and the port must
+be present and valid, so `CONNECT example.com:`, `CONNECT :443` and `CONNECT example.com:99999` are answered
+`400 Bad Request` (RFC 9110 9.3.6). A request target must be one
 of the four forms (RFC 9112 3.2): origin-form (an absolute path, or an empty path with a query),
 absolute-form (a URI with a scheme), authority-form (`uri-host ":" port`, only for `CONNECT`), or
 asterisk-form (`*`, only for `OPTIONS`); a target that matches none of them is answered `400 Bad Request`.
@@ -127,11 +140,17 @@ as `HTTP/1.`, `HTTP/1.x` or `HTTP/1.10`) is malformed and answered `400 Bad Requ
 major version (such as `HTTP/2.0`) is answered `505 HTTP Version Not Supported`.
 
 The request body length comes from the final transfer coding when a `Transfer-Encoding` is present
-(RFC 9112 6.3); this server decodes no transfer coding, so a final `chunked` coding is answered
-`501 Not Implemented` and any other final coding is answered `400 Bad Request`. An HTTP/1.0 request
-carrying a `Transfer-Encoding` is answered `400 Bad Request` because its framing is faulty
-(RFC 9112 6.1). Without a `Transfer-Encoding`, a `Content-Length` whose comma-separated values are
-all the same decimal value frames the body (RFC 9112 6.3 rule 5).
+(RFC 9112 6.3). A recipient must be able to parse and decode the chunked transfer coding
+(RFC 9112 6.1, 7.1), so a request whose final coding is `chunked` has its body decoded and discarded — the
+server never uses a body — and the request is served normally; each chunk-size line (including any chunk
+extensions) is limited to 1 KiB, and the trailer section is read and discarded, bounded by 64 KiB and 100 fields
+(RFC 9112 7.1.2). A coding list whose final coding is `chunked` but which names another coding the server does
+not decode (e.g. `gzip, chunked`) is answered `501 Not Implemented` (RFC 9112 6.1). Any other final coding is
+answered `400 Bad Request` because the body length cannot be determined reliably (RFC 9112 6.3 rule 4), and a
+coding that carries a parameter, or a request that carries both a `Transfer-Encoding` and a `Content-Length`, is
+answered `400 Bad Request` as well (RFC 9112 7.1, 6.3 rule 3). An HTTP/1.0 request carrying a `Transfer-Encoding`
+is answered `400 Bad Request` because its framing is faulty (RFC 9112 6.1). Without a `Transfer-Encoding`, a
+`Content-Length` whose comma-separated values are all the same decimal value frames the body (RFC 9112 6.3 rule 5).
 
 The parser is lenient in a few places: a bare LF is accepted as a line terminator, EOF ends the request line or
 the header block (the request is served as if the CRLF and the blank line had arrived), and leading blank lines
