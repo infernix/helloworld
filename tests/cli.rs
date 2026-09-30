@@ -4,7 +4,7 @@
 //! the server rejects 1.1 requests without exactly one valid `Host`.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,6 +18,9 @@ struct Server {
     child: Child,
     /// The ephemeral port it actually bound.
     port: u16,
+    /// The full startup line, e.g.
+    /// `helloworld listening on http://127.0.0.1:12345 (language: en)`.
+    startup: String,
     /// Retained reader over the child's stdout, positioned after the startup line.
     stdout: BufReader<ChildStdout>,
 }
@@ -40,6 +43,7 @@ impl Server {
                 Some(port) => Server {
                     child,
                     port,
+                    startup: line.trim_end().to_string(),
                     stdout,
                 },
                 None => panic!("unexpected startup line: {line:?}"),
@@ -91,6 +95,21 @@ fn request(port: u16, raw: &str) -> String {
     stream.set_write_timeout(Some(CLIENT_TIMEOUT)).unwrap();
     stream.write_all(raw.as_bytes()).expect("write request");
     stream.flush().unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).expect("read response");
+    String::from_utf8(buf).expect("response is UTF-8")
+}
+
+/// Send `raw`, half-close the write side, and read the response to EOF.
+///
+/// The half-close makes the server see EOF mid-request, so a short body fails.
+fn request_half_close(port: u16, raw: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.set_read_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+    stream.set_write_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+    stream.write_all(raw.as_bytes()).expect("write request");
+    stream.flush().unwrap();
+    stream.shutdown(Shutdown::Write).expect("shutdown write");
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).expect("read response");
     String::from_utf8(buf).expect("response is UTF-8")
@@ -239,6 +258,40 @@ fn text_flag_replaces_the_greeting() {
 }
 
 #[test]
+fn startup_line_reports_the_language() {
+    let server = Server::start(&["--lang", "nl"]);
+    assert!(
+        server.startup.contains("(language: nl)"),
+        "unexpected startup line: {:?}",
+        server.startup
+    );
+
+    let server = Server::start(&["--text", "hi"]);
+    assert!(
+        server.startup.contains("(language: custom (--text))"),
+        "unexpected startup line: {:?}",
+        server.startup
+    );
+}
+
+#[test]
+fn empty_text_is_served() {
+    let server = Server::start(&["--text", ""]);
+    assert!(
+        server.startup.contains("(language: custom (--text))"),
+        "unexpected startup line: {:?}",
+        server.startup
+    );
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(header(&response, "Content-Length"), Some("1"));
+    assert_eq!(body(&response), "\n");
+}
+
+#[test]
 fn head_returns_headers_without_a_body() {
     let server = Server::start(&[]);
     let response = request(
@@ -247,6 +300,40 @@ fn head_returns_headers_without_a_body() {
     );
     assert_eq!(status(&response), "HTTP/1.1 200 OK");
     assert_eq!(header(&response, "Content-Length"), Some("14"));
+    assert_eq!(body(&response), "");
+}
+
+#[test]
+fn head_healthz_has_no_body() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "HEAD /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(header(&response, "Content-Length"), Some("3"));
+    assert_eq!(body(&response), "");
+}
+
+#[test]
+fn head_unknown_path_is_404_without_body() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "HEAD /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 404 Not Found");
+    assert_eq!(body(&response), "");
+}
+
+#[test]
+fn head_error_response_has_no_body() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        &format!("HEAD /{}\r\nHost: localhost\r\n\r\n", "a".repeat(9000)),
+    );
+    assert_eq!(status(&response), "HTTP/1.1 414 URI Too Long");
     assert_eq!(body(&response), "");
 }
 
@@ -276,6 +363,34 @@ fn post_is_405_with_allow_header() {
 fn http11_without_host_is_400() {
     let server = Server::start(&[]);
     let response = request(server.port, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
+fn http12_is_served_as_11() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.2\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(body(&response), "Hello, World!\n");
+}
+
+#[test]
+fn asterisk_form_is_400() {
+    let server = Server::start(&[]);
+    let response = request(server.port, "GET * HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
+fn truncated_body_is_400() {
+    let server = Server::start(&[]);
+    let response = request_half_close(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nab",
+    );
     assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
 }
 
@@ -320,6 +435,67 @@ fn access_log_line_matches_the_contract() {
         "unexpected access log line: {line:?}"
     );
     assert!(line.ends_with("ms\n"), "missing duration: {line:?}");
+}
+
+#[test]
+fn query_is_stripped_from_the_log() {
+    let mut server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET /?x=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+
+    let line = server.next_log_line();
+    assert!(
+        line.contains(" GET / lang=en status=200 "),
+        "unexpected access log line: {line:?}"
+    );
+}
+
+#[test]
+fn access_log_records_status_and_language() {
+    let mut server = Server::start(&[]);
+    request(
+        server.port,
+        "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    let line = server.next_log_line();
+    assert!(
+        line.contains("- status=200"),
+        "unexpected access log line: {line:?}"
+    );
+
+    request(
+        server.port,
+        "GET /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    let line = server.next_log_line();
+    assert!(
+        line.contains("- status=404"),
+        "unexpected access log line: {line:?}"
+    );
+
+    request(
+        server.port,
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    let line = server.next_log_line();
+    assert!(
+        line.contains("- status=405"),
+        "unexpected access log line: {line:?}"
+    );
+
+    let mut server = Server::start(&["--text", "hi"]);
+    request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    let line = server.next_log_line();
+    assert!(
+        line.contains("lang=custom status=200"),
+        "unexpected access log line: {line:?}"
+    );
 }
 
 #[test]
@@ -392,13 +568,12 @@ fn slow_request_body_times_out() {
 #[test]
 fn over_capacity_returns_503() {
     let server = Server::start(&[]);
-    // Hold the server at capacity with idle connections, then ask for one more.
-    let idle: Vec<TcpStream> = (0..256)
-        .map(|_| TcpStream::connect(("127.0.0.1", server.port)).expect("connect"))
-        .collect();
-    thread::sleep(Duration::from_secs(1));
+    // Track the documented connection cap by probing after each idle connection
+    // rather than hardcoding it.
+    let mut idle: Vec<TcpStream> = Vec::new();
     let mut response = String::new();
-    for _ in 0..5 {
+    for _ in 0..512 {
+        idle.push(TcpStream::connect(("127.0.0.1", server.port)).expect("connect"));
         response = request(
             server.port,
             "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -406,12 +581,23 @@ fn over_capacity_returns_503() {
         if status(&response) == "HTTP/1.1 503 Service Unavailable" {
             break;
         }
-        thread::sleep(Duration::from_millis(500));
     }
     assert_eq!(status(&response), "HTTP/1.1 503 Service Unavailable");
     assert!(
         header(&response, "Retry-After").is_some(),
         "was {response:?}"
     );
+    // The rejection is bodyless, so it is also correct for `HEAD`.
+    assert_eq!(body(&response), "");
     drop(idle);
+}
+
+#[test]
+fn bind_failure_exits_one() {
+    let server = Server::start(&[]);
+    let port = server.port.to_string();
+    let (code, stdout, stderr) = run(&["--port", &port]);
+    assert_eq!(code, 1);
+    assert!(stdout.is_empty(), "unexpected stdout {stdout:?}");
+    assert!(!stderr.is_empty(), "expected an error message on stderr");
 }

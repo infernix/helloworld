@@ -97,12 +97,13 @@ struct RequestInfo {
 
 /// Accept connections forever, handling each one on its own thread.
 ///
-/// At most [`MAX_CONNECTIONS`] connections are served at once; while the server
-/// is at capacity, up to [`MAX_REJECTS`] further connections are answered with
-/// `503` on their own threads, and any beyond that are closed immediately.
-/// Accept errors back off briefly instead of spinning.
+/// At most [`MAX_CONNECTIONS`] connections are served at once, up to
+/// [`MAX_REJECTS`] further connections are answered with `503` on their own
+/// threads, and any beyond both budgets are closed immediately. Accept errors
+/// back off briefly instead of spinning.
 pub fn serve(listener: TcpListener, config: Arc<Config>) {
     let active = Arc::new(AtomicUsize::new(0));
+    let rejects = Arc::new(AtomicUsize::new(0));
     let logger = Logger::start();
     for incoming in listener.incoming() {
         match incoming {
@@ -115,16 +116,33 @@ pub fn serve(listener: TcpListener, config: Arc<Config>) {
                     active.fetch_sub(1, Ordering::Relaxed);
                     continue;
                 }
-                // Rejections run on their own threads too, so a slow client
-                // cannot stall the accept loop.
+                // Rejections are budgeted separately, so a burst of `503`s cannot
+                // consume the capacity meant for served connections.
                 let busy = previous >= MAX_CONNECTIONS;
+                let reject_slot = if busy {
+                    let previous_rejects = rejects.fetch_add(1, Ordering::Relaxed);
+                    if previous_rejects >= MAX_REJECTS {
+                        rejects.fetch_sub(1, Ordering::Relaxed);
+                        active.fetch_sub(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Some(Arc::clone(&rejects))
+                } else {
+                    None
+                };
+                // The guard is moved into the closure, so a failed spawn drops it
+                // and with it both reservations.
+                let guard = ActiveGuard {
+                    active: Arc::clone(&active),
+                    rejects: reject_slot,
+                };
                 let config = if busy {
                     None
                 } else {
                     Some(Arc::clone(&config))
                 };
-                let counter = Arc::clone(&active);
                 let logger = logger.clone();
+                let started = Instant::now();
                 let name = if busy {
                     "helloworld-reject"
                 } else {
@@ -134,7 +152,7 @@ pub fn serve(listener: TcpListener, config: Arc<Config>) {
                     .name(name.to_string())
                     .stack_size(HANDLER_STACK)
                     .spawn(move || {
-                        let _guard = ActiveGuard(counter);
+                        let _guard = guard;
                         match config {
                             Some(config) => {
                                 if let Err(err) = handle_connection(stream, &config, &logger) {
@@ -143,11 +161,10 @@ pub fn serve(listener: TcpListener, config: Arc<Config>) {
                                     }
                                 }
                             }
-                            None => reject_busy(&stream),
+                            None => reject_busy(&stream, &logger, started),
                         }
                     });
                 if let Err(err) = spawned {
-                    active.fetch_sub(1, Ordering::Relaxed);
                     eprintln!("helloworld: failed to spawn handler: {err}");
                 }
             }
@@ -159,28 +176,35 @@ pub fn serve(listener: TcpListener, config: Arc<Config>) {
     }
 }
 
-/// Decrements the active-thread counter when a worker thread ends.
-struct ActiveGuard(Arc<AtomicUsize>);
+/// Decrements the connection counters when a worker thread ends.
+struct ActiveGuard {
+    /// Live connection threads, served and rejecting alike.
+    active: Arc<AtomicUsize>,
+    /// Live reject threads, when this thread answers `503`.
+    rejects: Option<Arc<AtomicUsize>>,
+}
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        if let Some(rejects) = &self.rejects {
+            rejects.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
 /// Answer a connection that arrived while the server was at capacity.
-fn reject_busy(stream: &TcpStream) {
-    // The client sees the 503; the operator needs the overload in the log too.
-    eprintln!("helloworld: at capacity ({MAX_CONNECTIONS} connections), answering 503");
+///
+/// The response carries no body, so it is also correct for a `HEAD` request, and
+/// the rejection is recorded as a `status=503` access-log line.
+fn reject_busy(stream: &TcpStream, logger: &Logger, started: Instant) {
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    let peer = stream.peer_addr().ok();
+    let info = RequestInfo::new("-", "-", "-", "503 Service Unavailable");
     let mut writer = stream;
-    let _ = respond(
-        &mut writer,
-        "503 Service Unavailable",
-        &[("Retry-After", "1")],
-        "busy\n",
-        false,
-    );
+    if respond(&mut writer, info.status, &[("Retry-After", "1")], "", false).is_ok() {
+        logger.send(log_line(peer, &info, started.elapsed()));
+    }
     lingering_close(stream);
 }
 
@@ -227,14 +251,12 @@ fn handle_connection(stream: TcpStream, config: &Config, logger: &Logger) -> std
     match handle(&mut reader, &mut writer, config, &mut deadline) {
         Ok(Some(info)) => logger.send(log_line(peer, &info, started.elapsed())),
         Ok(None) => {}
-        Err(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
-            // A socket read timeout means the request never arrived in time;
-            // answer 408 instead of surfacing an error the client never sees.
-            if let Some(info) = answer_timeout(&mut writer) {
+        Err(Failure::TimedOut { head_only }) => {
+            if let Some(info) = answer_timeout(&mut writer, head_only) {
                 logger.send(log_line(peer, &info, started.elapsed()));
             }
         }
-        Err(err) => return Err(err),
+        Err(Failure::Io(err)) => return Err(err),
     }
     lingering_close(&stream);
     Ok(())
@@ -243,7 +265,8 @@ fn handle_connection(stream: TcpStream, config: &Config, logger: &Logger) -> std
 /// Whether `err` is a client that went away rather than a server fault.
 ///
 /// A client that resets or half-closes its side mid-request is normal traffic,
-/// so those errors are not worth logging.
+/// so those errors are not worth logging. A write timeout or `WouldBlock` means
+/// the client stopped reading, which is also not a server fault.
 fn is_disconnect(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -251,7 +274,28 @@ fn is_disconnect(err: &io::Error) -> bool {
             | ErrorKind::ConnectionAborted
             | ErrorKind::BrokenPipe
             | ErrorKind::UnexpectedEof
+            | ErrorKind::TimedOut
+            | ErrorKind::WouldBlock
     )
+}
+
+/// How a request ended when it produced no response.
+#[derive(Debug)]
+enum Failure {
+    /// The request head or body did not arrive before the deadline; `head_only`
+    /// records whether the client used `HEAD`.
+    TimedOut {
+        /// Whether the request method was `HEAD`.
+        head_only: bool,
+    },
+    /// The connection failed; a write timeout means the client stopped reading.
+    Io(io::Error),
+}
+
+impl From<io::Error> for Failure {
+    fn from(err: io::Error) -> Self {
+        Failure::Io(err)
+    }
 }
 
 /// Write the `408 Request Timeout` response and describe it.
@@ -259,13 +303,13 @@ fn is_disconnect(err: &io::Error) -> bool {
 /// Shared by `handle` (deadline expired) and `handle_connection` (socket read
 /// timeout) so both paths produce byte-identical output; the request may be
 /// unparsed, hence the `-` method/path/lang.
-fn answer_timeout<W: Write>(writer: &mut W) -> Option<RequestInfo> {
+fn answer_timeout<W: Write>(writer: &mut W, head_only: bool) -> Option<RequestInfo> {
     reply(
         writer,
         RequestInfo::new("-", "-", "-", "408 Request Timeout"),
         "request timeout\n",
         &[],
-        false,
+        head_only,
     )
     .ok()
     .flatten()
@@ -374,11 +418,15 @@ impl Deadline for SocketDeadline<'_> {
     }
 }
 
-/// Turn a deadline expiry into a `408`; other errors pass through.
-fn timeout_or<W: Write>(writer: &mut W, err: io::Error) -> io::Result<Option<RequestInfo>> {
+/// Turn a deadline expiry into a [`Failure::TimedOut`]; other errors pass through.
+///
+/// The `408` itself is written once by the caller (`handle_connection`, or the
+/// test harness), so a write that fails after a response has been delivered can
+/// never append a second `408`.
+fn timeout_or(err: io::Error, head_only: bool) -> Result<Option<RequestInfo>, Failure> {
     match err.kind() {
-        ErrorKind::TimedOut | ErrorKind::WouldBlock => Ok(answer_timeout(writer)),
-        _ => Err(err),
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => Err(Failure::TimedOut { head_only }),
+        _ => Err(Failure::Io(err)),
     }
 }
 
@@ -393,22 +441,24 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
     writer: &mut W,
     config: &Config,
     deadline: &mut D,
-) -> io::Result<Option<RequestInfo>> {
+) -> Result<Option<RequestInfo>, Failure> {
     let mut buf = Vec::new();
 
     // Skip any leading blank lines, then read the request line.
     let request_line = loop {
         match read_line(reader, MAX_REQUEST_LINE, &mut buf, deadline) {
-            Err(err) => return timeout_or(writer, err),
+            Err(err) => return timeout_or(err, false),
             Ok(ReadLine::Eof) => return Ok(None),
             Ok(ReadLine::TooLong) => {
+                let method = line_method(&buf);
+                let head_only = method == "HEAD";
                 return fail(
                     writer,
-                    "-",
+                    &method,
                     "-",
                     "414 URI Too Long",
                     "request line too long\n",
-                    false,
+                    head_only,
                 );
             }
             Ok(ReadLine::Line(line)) => {
@@ -420,22 +470,37 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
     };
 
     let mut parts = request_line.split_whitespace();
-    let (method, target, version) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+    let first = parts.next();
+    let head_only = first == Some("HEAD");
+    let (method, target, version) = match (first, parts.next(), parts.next(), parts.next()) {
         (Some(method), Some(target), Some(version), None) => (method, target, version),
         _ => {
-            return fail(writer, "-", "-", "400 Bad Request", "bad request\n", false);
+            return fail(
+                writer,
+                first.unwrap_or("-"),
+                "-",
+                "400 Bad Request",
+                "bad request\n",
+                head_only,
+            );
         }
     };
 
     // Absolute-form targets are accepted (RFC 7230 5.3.2); routing and
     // logging use the origin-form path only.
-    let path = origin_path(target)
-        .split(['?', '#'])
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let head_only = method == "HEAD";
-    if !is_token(method) || target.is_empty() || target.bytes().any(|b| b.is_ascii_control()) {
+    let path = request_path(target).to_string();
+    // Asterisk-form is only valid for a server-wide OPTIONS request (RFC 7230 5.3.4).
+    if target == "*" && method != "OPTIONS" {
+        return fail(
+            writer,
+            method,
+            &path,
+            "400 Bad Request",
+            "bad request\n",
+            head_only,
+        );
+    }
+    if !is_token(method) || target.bytes().any(|b| b.is_ascii_control()) {
         return fail(
             writer,
             method,
@@ -455,7 +520,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             head_only,
         );
     }
-    if version != "HTTP/1.0" && version != "HTTP/1.1" {
+    let Some(version) = parse_version(version) else {
         return fail(
             writer,
             method,
@@ -464,14 +529,14 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             "http version not supported\n",
             head_only,
         );
-    }
+    };
 
     // Read headers until the blank line that ends the header block.
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut header_bytes = 0_usize;
     loop {
         match read_line(reader, MAX_HEADER_LINE, &mut buf, deadline) {
-            Err(err) => return timeout_or(writer, err),
+            Err(err) => return timeout_or(err, head_only),
             Ok(ReadLine::Eof) => break,
             Ok(ReadLine::TooLong) => {
                 return fail(
@@ -561,7 +626,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
         );
     }
 
-    let mut content_length: Option<u64> = None;
+    let mut raw_length: Option<&str> = None;
     for (_, value) in headers.iter().filter(|(name, _)| name == "content-length") {
         // A valid Content-Length is `1*DIGIT`; anything else is malformed.
         if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
@@ -574,22 +639,10 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                 head_only,
             );
         }
-        // Digits-only but overflowing `u64` or the body cap is too large.
-        let parsed = match value.parse::<u64>() {
-            Ok(parsed) if parsed <= MAX_BODY as u64 => parsed,
-            _ => {
-                return fail(
-                    writer,
-                    method,
-                    &path,
-                    "413 Payload Too Large",
-                    "payload too large\n",
-                    head_only,
-                );
-            }
-        };
-        if let Some(previous) = content_length {
-            if previous != parsed {
+        // RFC 7230 3.3.2: conflicting field-values are an unrecoverable
+        // framing error, whatever their magnitude, so compare the raw values.
+        if let Some(previous) = raw_length {
+            if previous != value {
                 return fail(
                     writer,
                     method,
@@ -600,7 +653,34 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                 );
             }
         }
-        content_length = Some(parsed);
+        raw_length = Some(value);
+    }
+    let content_length = match raw_length {
+        // Digits-only, so only an overflowing magnitude can fail to parse.
+        Some(value) => match value.parse::<u64>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return fail(
+                    writer,
+                    method,
+                    &path,
+                    "413 Payload Too Large",
+                    "payload too large\n",
+                    head_only,
+                );
+            }
+        },
+        None => 0,
+    };
+    if content_length > MAX_BODY as u64 {
+        return fail(
+            writer,
+            method,
+            &path,
+            "413 Payload Too Large",
+            "payload too large\n",
+            head_only,
+        );
     }
 
     if !host_is_valid(version, &headers) {
@@ -617,7 +697,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
     match header(&headers, "expect") {
         // An HTTP/1.0 client cannot understand 1xx; ignore the expectation
         // (RFC 7231 5.1.1) and read the body as usual.
-        Some(value) if version == "HTTP/1.1" && value.eq_ignore_ascii_case("100-continue") => {
+        Some(value) if version == Version::Http11 && value.eq_ignore_ascii_case("100-continue") => {
             writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
             writer.flush()?;
         }
@@ -637,13 +717,16 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
 
     // Drain the body, re-arming the deadline before every chunk so a client
     // that trickles the body cannot hold the connection open.
-    let mut remaining = content_length.unwrap_or(0);
+    let mut remaining = content_length;
     let mut scratch = [0_u8; 8192];
     while remaining > 0 {
         if let Err(err) = deadline.arm() {
-            return timeout_or(writer, err);
+            return timeout_or(err, head_only);
         }
-        let read = (&mut *reader).take(remaining).read(&mut scratch)?;
+        let read = match (&mut *reader).take(remaining).read(&mut scratch) {
+            Ok(read) => read,
+            Err(err) => return timeout_or(err, head_only),
+        };
         if read == 0 {
             break;
         }
@@ -720,7 +803,7 @@ fn reply<W: Write>(
     body: &str,
     extra: &[(&str, &str)],
     head_only: bool,
-) -> std::io::Result<Option<RequestInfo>> {
+) -> Result<Option<RequestInfo>, Failure> {
     respond(writer, info.status, extra, body, head_only)?;
     Ok(Some(info))
 }
@@ -733,7 +816,7 @@ fn fail<W: Write>(
     status: &'static str,
     body: &str,
     head_only: bool,
-) -> std::io::Result<Option<RequestInfo>> {
+) -> Result<Option<RequestInfo>, Failure> {
     reply(
         writer,
         RequestInfo::new(method, path, "-", status),
@@ -814,11 +897,61 @@ fn origin_path(target: &str) -> &str {
     }
 }
 
+/// Extract the origin-form path a request target routes on.
+///
+/// Absolute-form targets are reduced to their origin form (RFC 7230 5.3.2), the
+/// query and fragment are dropped, and a target with an empty path (`?q=1`,
+/// `http://host?q=1`, `http://host#f`) routes as `/`, since an empty path is
+/// equivalent to `/` (RFC 3986 6.2.3).
+fn request_path(target: &str) -> &str {
+    let path = origin_path(target).split(['?', '#']).next().unwrap_or("");
+    if path.is_empty() {
+        "/"
+    } else {
+        path
+    }
+}
+
+/// HTTP version of a request, after folding higher `1.x` minors to 1.1.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Version {
+    /// HTTP/1.0.
+    Http10,
+    /// HTTP/1.1, or any higher `HTTP/1.x` minor (RFC 7230 2.6).
+    Http11,
+}
+
+/// Parse a request's HTTP version token.
+///
+/// A higher `HTTP/1.x` minor version is processed as 1.1 (RFC 7230 2.6); a
+/// different major version is unsupported.
+fn parse_version(version: &str) -> Option<Version> {
+    match version {
+        "HTTP/1.0" => Some(Version::Http10),
+        _ => {
+            let minor = version.strip_prefix("HTTP/1.")?;
+            if minor.is_empty() || !minor.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some(Version::Http11)
+        }
+    }
+}
+
+/// Method token of a possibly partial request line, for logging and `HEAD` detection.
+fn line_method(buf: &[u8]) -> String {
+    String::from_utf8_lossy(buf)
+        .split_whitespace()
+        .next()
+        .unwrap_or("-")
+        .to_string()
+}
+
 /// Whether the `Host` header(s) satisfy the request's HTTP version.
 ///
 /// HTTP/1.1 requires exactly one non-empty, ASCII-graphic `Host`; HTTP/1.0 makes
 /// it optional but still rejects duplicates.
-fn host_is_valid(version: &str, headers: &[(String, String)]) -> bool {
+fn host_is_valid(version: Version, headers: &[(String, String)]) -> bool {
     let mut host = None;
     let mut count = 0_usize;
     for (_, value) in headers.iter().filter(|(name, _)| name == "host") {
@@ -828,7 +961,7 @@ fn host_is_valid(version: &str, headers: &[(String, String)]) -> bool {
     if count > 1 {
         return false;
     }
-    if version == "HTTP/1.0" {
+    if version == Version::Http10 {
         return true;
     }
     host.is_some_and(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_graphic()))
@@ -992,10 +1125,10 @@ fn log_line(peer: Option<SocketAddr>, info: &RequestInfo, elapsed: Duration) -> 
 fn sanitize(value: &str) -> String {
     let mut out: String = value
         .chars()
-        .take(MAX_LOG_FIELD)
+        .take(MAX_LOG_FIELD - 3)
         .map(|ch| if ch.is_control() { '?' } else { ch })
         .collect();
-    if value.chars().nth(MAX_LOG_FIELD).is_some() {
+    if value.chars().nth(MAX_LOG_FIELD - 3).is_some() {
         out.push_str("...");
     }
     out
@@ -1019,6 +1152,23 @@ mod tests {
         let mut reader = BufReader::new(Cursor::new(request.as_bytes().to_vec()));
         let mut writer = Vec::new();
         let info = handle(&mut reader, &mut writer, config, &mut ()).expect("handle must succeed");
+        let response = String::from_utf8(writer).expect("response must be utf-8");
+        (response, info)
+    }
+
+    /// Run one request through `handle` with a deadline, mirroring
+    /// `handle_connection`: a deadline expiry is answered with `408`.
+    fn run_deadline<R: BufRead, D: Deadline>(
+        reader: &mut R,
+        config: &Config,
+        deadline: &mut D,
+    ) -> (String, Option<RequestInfo>) {
+        let mut writer = Vec::new();
+        let info = match handle(reader, &mut writer, config, deadline) {
+            Ok(info) => info,
+            Err(Failure::TimedOut { head_only }) => answer_timeout(&mut writer, head_only),
+            Err(Failure::Io(err)) => panic!("io error: {err}"),
+        };
         let response = String::from_utf8(writer).expect("response must be utf-8");
         (response, info)
     }
@@ -1251,11 +1401,11 @@ mod tests {
 
     #[test]
     fn long_request_line_is_uri_too_long() {
-        let request = format!("{}\r\n", "a".repeat(9000));
+        let request = format!("GET /{}\r\n", "a".repeat(9000));
         let (_, info) = run(&request, &default_config());
         let info = info.expect("served");
         assert_eq!(info.status, "414 URI Too Long");
-        assert_eq!(info.method, "-");
+        assert_eq!(info.method, "GET");
         assert_eq!(info.path, "-");
         assert_eq!(info.lang, "-");
     }
@@ -1333,20 +1483,12 @@ mod tests {
         let mut reader = BufReader::new(Cursor::new(
             b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
         ));
-        let mut writer = Vec::new();
-        let info = handle(
-            &mut reader,
-            &mut writer,
-            &default_config(),
-            &mut ExpiredDeadline,
-        )
-        .expect("handle must succeed")
-        .expect("served");
+        let (response, info) = run_deadline(&mut reader, &default_config(), &mut ExpiredDeadline);
+        let info = info.expect("served");
         assert_eq!(info.status, "408 Request Timeout");
         assert_eq!(info.method, "-");
         assert_eq!(info.path, "-");
         assert_eq!(info.lang, "-");
-        let response = String::from_utf8(writer).expect("response must be utf-8");
         assert!(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
         assert_eq!(body(&response), "request timeout\n");
     }
@@ -1354,7 +1496,7 @@ mod tests {
     #[test]
     fn answer_timeout_writes_408() {
         let mut writer = Vec::new();
-        let info = answer_timeout(&mut writer).expect("served");
+        let info = answer_timeout(&mut writer, false).expect("served");
         assert_eq!(info.status, "408 Request Timeout");
         let response = String::from_utf8(writer).expect("response must be utf-8");
         assert!(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
@@ -1416,7 +1558,8 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         let client = TcpStream::connect(addr).expect("connect");
         let (server, _) = listener.accept().expect("accept");
-        reject_busy(&server);
+        let (logger, lines) = Logger::capturing();
+        reject_busy(&server, &logger, Instant::now());
 
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1427,6 +1570,12 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 503"), "was {response:?}");
         reader.read_to_string(&mut response).expect("read body");
         assert!(response.contains("Retry-After: 1"), "was {response:?}");
+        assert_eq!(body(&response), "", "was {response:?}");
+
+        let line = lines
+            .recv_timeout(Duration::from_secs(1))
+            .expect("log line");
+        assert!(line.contains("status=503"), "was {line}");
     }
 
     #[test]
@@ -1489,8 +1638,8 @@ mod tests {
         assert_eq!(sanitize("a\n\u{1b}b"), "a??b");
         let long = "x".repeat(200);
         let sanitized = sanitize(&long);
-        assert_eq!(sanitized.len(), MAX_LOG_FIELD + 3);
-        assert_eq!(&sanitized[..MAX_LOG_FIELD], &long[..MAX_LOG_FIELD]);
+        assert_eq!(sanitized.len(), MAX_LOG_FIELD);
+        assert_eq!(&sanitized[..MAX_LOG_FIELD - 3], &long[..MAX_LOG_FIELD - 3]);
         assert!(sanitized.ends_with("..."));
     }
 
@@ -1565,32 +1714,24 @@ mod tests {
         // outlast the whole head and still expire inside the body drain.
         let head = request.find("\r\n\r\n").expect("head") + 4;
         let mut reader = BufReader::new(Trickle::new(request.into_bytes()));
-        let mut writer = Vec::new();
-        let info = handle(
+        let (_, info) = run_deadline(
             &mut reader,
-            &mut writer,
             &default_config(),
             &mut CountdownDeadline { arms: head + 6 },
-        )
-        .expect("handle must succeed")
-        .expect("served");
-        assert_eq!(info.status, "408 Request Timeout");
+        );
+        assert_eq!(info.expect("served").status, "408 Request Timeout");
     }
 
     #[test]
     fn trickled_head_is_request_timeout() {
         let request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let mut reader = BufReader::new(Trickle::new(request.as_bytes().to_vec()));
-        let mut writer = Vec::new();
-        let info = handle(
+        let (_, info) = run_deadline(
             &mut reader,
-            &mut writer,
             &default_config(),
             &mut CountdownDeadline { arms: 4 },
-        )
-        .expect("handle must succeed")
-        .expect("served");
-        assert_eq!(info.status, "408 Request Timeout");
+        );
+        assert_eq!(info.expect("served").status, "408 Request Timeout");
     }
 
     #[test]
@@ -1747,5 +1888,150 @@ mod tests {
             &default_config(),
         );
         assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn empty_path_targets_serve_root() {
+        for request in [
+            "GET http://localhost?x=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET ?x=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET http://localhost#f HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ] {
+            let (response, info) = run(request, &default_config());
+            let info = info.expect("served");
+            assert_eq!(info.status, "200 OK", "was {request:?}");
+            assert_eq!(info.path, "/", "was {request:?}");
+            assert_eq!(body(&response), "Hello, World!\n");
+        }
+    }
+
+    #[test]
+    fn head_timeout_has_no_body() {
+        let request = "HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        // The request line is trickled and read in full, so `HEAD` is known,
+        // before the deadline expires while the headers are read.
+        let line_arms = request.find("\r\n").expect("line") + 2;
+        let mut reader = BufReader::new(Trickle::new(request.as_bytes().to_vec()));
+        let (response, info) = run_deadline(
+            &mut reader,
+            &default_config(),
+            &mut CountdownDeadline { arms: line_arms },
+        );
+        let info = info.expect("served");
+        assert_eq!(info.status, "408 Request Timeout");
+        assert_eq!(body(&response), "");
+        assert_eq!(header_value(&response, "Content-Length"), Some("16"));
+    }
+
+    #[test]
+    fn head_uri_too_long_has_no_body() {
+        let request = format!("HEAD /{}\r\n", "a".repeat(9000));
+        let (response, info) = run(&request, &default_config());
+        let info = info.expect("served");
+        assert_eq!(info.status, "414 URI Too Long");
+        assert_eq!(info.method, "HEAD");
+        assert_eq!(body(&response), "");
+    }
+
+    #[test]
+    fn conflicting_oversized_content_lengths_are_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nContent-Length: 99999999999999999999\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn truncated_body_is_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nab",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn header_line_over_limit_is_431() {
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nX: {}\r\n\r\n",
+            "a".repeat(9000)
+        );
+        let (_, info) = run(&request, &default_config());
+        assert_eq!(
+            info.expect("served").status,
+            "431 Request Header Fields Too Large"
+        );
+    }
+
+    #[test]
+    fn header_bytes_over_limit_is_431() {
+        let value = "a".repeat(MAX_HEADER_LINE - "X: ".len());
+        let mut request = String::from("GET / HTTP/1.1\r\nHost: localhost\r\n");
+        for _ in 0..9 {
+            request.push_str("X: ");
+            request.push_str(&value);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        let (_, info) = run(&request, &default_config());
+        assert_eq!(
+            info.expect("served").status,
+            "431 Request Header Fields Too Large"
+        );
+    }
+
+    #[test]
+    fn http12_is_served_as_11() {
+        let (response, info) = run(
+            "GET / HTTP/1.2\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "200 OK");
+        assert_eq!(body(&response), "Hello, World!\n");
+    }
+
+    #[test]
+    fn http20_is_505() {
+        let (_, info) = run(
+            "GET / HTTP/2.0\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(
+            info.expect("served").status,
+            "505 HTTP Version Not Supported"
+        );
+    }
+
+    #[test]
+    fn asterisk_form_is_400() {
+        let (_, info) = run(
+            "GET * HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn options_asterisk_is_405() {
+        let (response, info) = run(
+            "OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        let info = info.expect("served");
+        assert_eq!(info.status, "405 Method Not Allowed");
+        assert_eq!(header_value(&response, "Allow"), Some("GET, HEAD"));
+    }
+
+    #[test]
+    fn query_and_fragment_are_stripped() {
+        let (response, info) = run(
+            "GET /?x=1#f HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        let info = info.expect("served");
+        assert_eq!(info.status, "200 OK");
+        assert_eq!(info.path, "/");
+        assert_eq!(body(&response), "Hello, World!\n");
     }
 }

@@ -60,9 +60,9 @@ A tiny multilingual hello-world HTTP server.
 
 Options:
   -l, --lang <CODE>    Language code for the greeting (default: en)
-  -t, --text <STRING>  Custom greeting, replaces the greeting entirely (max 8 KiB)
-  -p, --port <PORT>    TCP port (default: 21212, 0 = any free port)
-      --host <IP>      IP address to bind (default: 127.0.0.1)
+  -t, --text <STRING>  Custom greeting, replaces the greeting entirely (max {MAX_TEXT} bytes)
+  -p, --port <PORT>    TCP port (default: {DEFAULT_PORT}, 0 = any free port)
+      --host <IP>      IP address to bind (default: {DEFAULT_HOST})
       --list-langs     List supported language codes and exit
   -V, --version        Print version and exit
   -h, --help           Print this help and exit
@@ -81,6 +81,8 @@ Examples:
   curl -s -H 'Accept-Language: de-DE,de;q=0.9' http://127.0.0.1:{DEFAULT_PORT}/
 ",
         DEFAULT_PORT = DEFAULT_PORT,
+        MAX_TEXT = MAX_TEXT,
+        DEFAULT_HOST = DEFAULT_HOST,
         codes = i18n::supported_codes()
     )
 }
@@ -101,16 +103,22 @@ fn flag_value(
     inline: Option<&str>,
 ) -> Result<String, String> {
     if let Some(value) = inline {
-        if value.is_empty() {
-            return Err(format!("missing value for {name}"));
-        }
         return Ok(value.to_string());
     }
     *index += 1;
     match argv.get(*index) {
-        Some(value) if !value.is_empty() => Ok(value.clone()),
-        _ => Err(format!("missing value for {name}")),
+        Some(value) => Ok(value.clone()),
+        None => Err(format!("missing value for {name}")),
     }
+}
+
+/// Strip one pair of surrounding brackets, so the `[::1]` form the startup line
+/// prints can be passed back to `--host`.
+fn unbracket(value: &str) -> &str {
+    value
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(value)
 }
 
 /// Parse `argv` (program name already stripped) into a [`Command`].
@@ -131,6 +139,7 @@ fn parse_args(argv: &[String]) -> Result<Command, String> {
         };
 
         match name {
+            "--" => {}
             "-h" | "--help" => return Ok(Command::Help),
             "--list-langs" => return Ok(Command::ListLangs),
             "-V" | "--version" => return Ok(Command::Version),
@@ -140,7 +149,8 @@ fn parse_args(argv: &[String]) -> Result<Command, String> {
                     Some(lang) => options.lang = Some(lang.code),
                     None => {
                         return Err(format!(
-                            "unsupported language code '{value}'; supported codes: {}",
+                            "unsupported language code '{}'; supported codes: {}",
+                            value.escape_debug(),
                             i18n::supported_codes()
                         ));
                     }
@@ -157,19 +167,22 @@ fn parse_args(argv: &[String]) -> Result<Command, String> {
                 let value = flag_value(argv, &mut index, name, inline)?;
                 match value.parse::<u16>() {
                     Ok(port) => options.port = port,
-                    Err(_) => return Err(format!("invalid port '{value}'")),
+                    Err(_) => return Err(format!("invalid port '{}'", value.escape_debug())),
                 }
             }
             "--host" => {
                 let value = flag_value(argv, &mut index, name, inline)?;
-                match value.parse::<IpAddr>() {
+                match unbracket(&value).parse::<IpAddr>() {
                     Ok(host) => options.host = host,
                     Err(_) => {
-                        return Err(format!("invalid host '{value}' (expected an IP address)"));
+                        return Err(format!(
+                            "invalid host '{}' (expected an IP address)",
+                            value.escape_debug()
+                        ));
                     }
                 }
             }
-            other => return Err(format!("unknown argument '{other}'")),
+            other => return Err(format!("unknown argument '{}'", other.escape_debug())),
         }
 
         index += 1;
@@ -400,11 +413,39 @@ mod tests {
     }
 
     #[test]
-    fn empty_inline_text_is_an_error() {
-        assert_eq!(
-            parse_args(&argv(&["--text="])),
-            Err("missing value for --text".to_string())
+    fn empty_text_is_an_empty_greeting() {
+        assert_eq!(run_options(&["--text", ""]).text, Some(String::new()));
+        assert_eq!(run_options(&["--text="]).text, Some(String::new()));
+    }
+
+    #[test]
+    fn empty_language_is_an_error() {
+        let err = parse_args(&argv(&["--lang", ""])).unwrap_err();
+        assert!(
+            err.starts_with("unsupported language code ''"),
+            "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn empty_port_is_an_error() {
+        assert_eq!(
+            parse_args(&argv(&["--port="])),
+            Err("invalid port ''".to_string())
+        );
+    }
+
+    #[test]
+    fn bracketed_ipv6_host_is_accepted() {
+        assert_eq!(
+            run_options(&["--host", "[::1]"]).host,
+            "::1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn end_of_options_marker_is_ignored() {
+        assert_eq!(run_options(&["--", "--lang", "nl"]).lang, Some("nl"));
     }
 
     #[test]

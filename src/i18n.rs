@@ -185,8 +185,10 @@ pub fn supported_codes() -> String {
 /// parameter name is matched case-insensitively and its value is parsed after
 /// trimming surrounding whitespace; a value that is missing, malformed, not a
 /// finite number or outside `0.0..=1.0` yields a quality of `0.0`, disabling
-/// the entry. An entry whose tag is exactly `*` matches any language and
-/// resolves to [`DEFAULT_CODE`], but only if it wins on quality.
+/// the entry. An entry whose tag is exactly `*` matches any language not named
+/// by another entry, resolving to the first such catalog language (falling back
+/// to [`DEFAULT_CODE`] when every one is named), but only if it wins on
+/// quality.
 pub fn negotiate(header: &str) -> Option<&'static str> {
     let mut entries: Vec<(f32, &str)> = Vec::new();
     for raw in header.split(',') {
@@ -198,14 +200,17 @@ pub fn negotiate(header: &str) -> Option<&'static str> {
         let tag = parts.next().unwrap_or("").trim();
         let mut quality = 1.0_f32;
         for param in parts {
-            let Some((name, value)) = param.split_once('=') else {
-                continue;
-            };
-            if name.trim().eq_ignore_ascii_case("q") {
-                quality = match value.trim().parse::<f32>() {
-                    Ok(parsed) if (0.0..=1.0).contains(&parsed) => parsed,
-                    _ => 0.0,
-                };
+            let param = param.trim();
+            match param.split_once('=') {
+                Some((name, value)) if name.trim().eq_ignore_ascii_case("q") => {
+                    quality = match value.trim().parse::<f32>() {
+                        Ok(parsed) if (0.0..=1.0).contains(&parsed) => parsed,
+                        _ => 0.0,
+                    };
+                }
+                // A `q` with no value is malformed and disables the entry.
+                None if param.eq_ignore_ascii_case("q") => quality = 0.0,
+                _ => {}
             }
         }
         entries.push((quality, tag));
@@ -213,12 +218,19 @@ pub fn negotiate(header: &str) -> Option<&'static str> {
 
     entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    for (quality, tag) in entries {
+    for &(quality, tag) in &entries {
         if quality <= 0.0 {
             continue;
         }
         if tag == "*" {
-            return Some(DEFAULT_CODE);
+            // `*` matches every tag not named by another entry (RFC 7231 5.3.5),
+            // so it resolves to the first catalog language the header does not
+            // name, keeping `en` as the fallback when every one is named.
+            return CATALOG
+                .iter()
+                .map(|lang| lang.code)
+                .find(|code| !entries.iter().any(|(_, tag)| normalize(tag) == *code))
+                .or(Some(DEFAULT_CODE));
         }
         if let Some(lang) = lookup(tag) {
             return Some(lang.code);
@@ -275,6 +287,25 @@ mod tests {
     fn negotiate_orders_wildcard_by_quality() {
         assert_eq!(negotiate("de;q=0.5, *;q=0.9"), Some("en"));
         assert_eq!(negotiate("*;q=0.1, de;q=0.9"), Some("de"));
+    }
+
+    #[test]
+    fn negotiate_wildcard_skips_languages_named_by_other_entries() {
+        assert_eq!(negotiate("*;q=1,en;q=0.5"), Some("nl"));
+        assert_eq!(negotiate("en;q=0, *"), Some("nl"));
+        let all_named = CATALOG
+            .iter()
+            .map(|lang| format!("{};q=0", lang.code))
+            .collect::<Vec<_>>()
+            .join(", ")
+            + ", *";
+        assert_eq!(negotiate(&all_named), Some(DEFAULT_CODE));
+    }
+
+    #[test]
+    fn negotiate_treats_a_valueless_quality_as_disabled() {
+        assert_eq!(negotiate("nl;q"), None);
+        assert_eq!(negotiate("nl;q,de;q=0.5"), Some("de"));
     }
 
     #[test]
