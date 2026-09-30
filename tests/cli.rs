@@ -6,7 +6,8 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Read/write timeout for the test client socket.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -319,4 +320,98 @@ fn access_log_line_matches_the_contract() {
         "unexpected access log line: {line:?}"
     );
     assert!(line.ends_with("ms\n"), "missing duration: {line:?}");
+}
+
+#[test]
+fn malformed_header_line_is_400() {
+    let server = Server::start(&[]);
+    let response = request(server.port, "GET / HTTP/1.1\r\nHost : localhost\r\n\r\n");
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
+fn absolute_form_target_is_served() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(body(&response), "Hello, World!\n");
+}
+
+#[test]
+fn http10_ignores_expect_100_continue() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(body(&response), "Hello, World!\n");
+}
+
+#[test]
+fn slow_request_body_times_out() {
+    let server = Server::start(&[]);
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .expect("write timeout");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n")
+        .expect("write head");
+
+    // Trickle the body so only the 10s request deadline can answer.
+    let started = Instant::now();
+    let mut response = Vec::new();
+    while started.elapsed() < Duration::from_secs(12) {
+        thread::sleep(Duration::from_millis(1000));
+        let mut scratch = [0_u8; 1024];
+        if let Ok(read) = stream.read(&mut scratch) {
+            if read > 0 {
+                response.extend_from_slice(&scratch[..read]);
+                break;
+            }
+        }
+        if stream.write_all(b"x").is_err() {
+            break;
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&response).starts_with("HTTP/1.1 408"),
+        "expected 408, got {:?} after {:?}",
+        String::from_utf8_lossy(&response),
+        started.elapsed()
+    );
+}
+
+#[test]
+fn over_capacity_returns_503() {
+    let server = Server::start(&[]);
+    // Hold the server at capacity with idle connections, then ask for one more.
+    let idle: Vec<TcpStream> = (0..256)
+        .map(|_| TcpStream::connect(("127.0.0.1", server.port)).expect("connect"))
+        .collect();
+    thread::sleep(Duration::from_secs(1));
+    let mut response = String::new();
+    for _ in 0..5 {
+        response = request(
+            server.port,
+            "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        if status(&response) == "HTTP/1.1 503 Service Unavailable" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(status(&response), "HTTP/1.1 503 Service Unavailable");
+    assert!(
+        header(&response, "Retry-After").is_some(),
+        "was {response:?}"
+    );
+    drop(idle);
 }

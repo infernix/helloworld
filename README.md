@@ -49,9 +49,12 @@ exit non-zero with a message on stderr. An unsupported language code also exits 
 error on stderr and lists the supported codes.
 
 The server binds `<host>:<port>` (default `127.0.0.1:21212`) and handles each connection on its own
-thread, with at most 256 concurrent connections; connections beyond that limit receive
-`503 Service Unavailable` with a `Retry-After: 1` header. Each connection has a 10s read timeout and a
-10s write timeout. On startup one line is printed with the address actually bound:
+thread, with at most 256 connections served at once. Connections beyond that limit receive
+`503 Service Unavailable` with a `Retry-After: 1` header; up to 64 rejections run concurrently on their
+own threads, so a slow client cannot stall the accept loop, and any further connections are closed
+immediately. Each connection has a 10s read timeout and a 10s write timeout; after the response is written
+the write side is half-closed and the read side drained for at most 500 ms in total before the socket is
+closed. On startup one line is printed with the address actually bound:
 `helloworld listening on http://127.0.0.1:<port> (language: <en|custom (--text)|<code>>)`.
 
 Passing `--port 0` asks the OS for any free port; the startup line then prints the real port that was
@@ -68,11 +71,17 @@ Requests that exceed the parser's limits are rejected with a short plain-text bo
 | Request body larger than 8 MiB                               | `413 Payload Too Large`             |
 | Body sent with `Transfer-Encoding` (chunked)                  | `501 Not Implemented`               |
 | HTTP version other than `1.0` or `1.1`                       | `505 HTTP Version Not Supported`     |
-| Malformed request line                                      | `400 Bad Request`                   |
+| Malformed request line, method or request target             | `400 Bad Request`                   |
 | HTTP/1.1 request without exactly one valid `Host` header     | `400 Bad Request`                   |
 | `Content-Length` that is not a plain decimal number, or two conflicting values | `400 Bad Request`    |
+| Malformed header line: no colon, whitespace before the colon, a non-token field name, an obsolete folded continuation line, or a control character in the value | `400 Bad Request` |
 | `Expect` header with a value other than `100-continue`        | `417 Expectation Failed`            |
-| Request head not complete within 10 s                         | `408 Request Timeout`               |
+| Request head and body not complete within 10 s                  | `408 Request Timeout`               |
+
+`Expect: 100-continue` is answered with `100 Continue` only for HTTP/1.1 requests; in an HTTP/1.0
+request the expectation is ignored (RFC 7231) and the body is read as usual. Absolute-form request
+targets such as `GET http://example.com/ HTTP/1.1` are accepted (RFC 7230); routing and logging use
+the path.
 
 ### Access log
 
@@ -89,6 +98,10 @@ serving the request in milliseconds with one decimal. For example:
 ```
 2026-09-30T11:15:00Z 127.0.0.1:54321 GET / lang=en status=200 dur=0.4ms
 ```
+
+The startup line and the access log are written to stdout; usage errors, bind, accept and spawn
+failures, and connection errors that are not client disconnects are written to stderr. A client that
+disconnects mid-request is normal and is not logged as an error.
 
 ## Endpoints
 

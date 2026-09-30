@@ -32,6 +32,9 @@ const MAX_BODY: usize = 8 * 1024 * 1024;
 /// Largest number of connections served concurrently.
 const MAX_CONNECTIONS: usize = 256;
 
+/// Largest number of connections answered with `503` at once.
+const MAX_REJECTS: usize = 64;
+
 /// Stack size for a connection handler thread.
 const HANDLER_STACK: usize = 256 * 1024;
 
@@ -41,10 +44,10 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Write timeout applied to every accepted connection.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Deadline for reading one complete request head (request line + headers).
+/// Deadline for reading one complete request (request line, headers and body).
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long the read side is drained after a response before closing.
+/// Total time the read side is drained after a response before closing.
 const LINGER_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Largest number of bytes read while draining a half-closed connection.
@@ -90,31 +93,51 @@ struct RequestInfo {
 
 /// Accept connections forever, handling each one on its own thread.
 ///
-/// At most [`MAX_CONNECTIONS`] connections are handled at once; further
-/// connections receive an immediate `503`. Accept errors back off briefly instead of
-/// spinning.
+/// At most [`MAX_CONNECTIONS`] connections are served at once; while the server
+/// is at capacity, up to [`MAX_REJECTS`] further connections are answered with
+/// `503` on their own threads, and any beyond that are closed immediately.
+/// Accept errors back off briefly instead of spinning.
 pub fn serve(listener: TcpListener, config: Arc<Config>) {
     let active = Arc::new(AtomicUsize::new(0));
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
-                // Reserve the slot before spawning so the count can never exceed the
-                // cap: two threads racing here cannot both observe a free slot.
+                // Reserve the slot before spawning so the count can never exceed
+                // the cap: two threads racing here cannot both observe a free slot.
                 let previous = active.fetch_add(1, Ordering::Relaxed);
-                if previous >= MAX_CONNECTIONS {
+                if previous >= MAX_CONNECTIONS + MAX_REJECTS {
+                    // No capacity left to answer: closing still sheds the load.
                     active.fetch_sub(1, Ordering::Relaxed);
-                    reject_busy(stream);
                     continue;
                 }
-                let config = Arc::clone(&config);
+                // Rejections run on their own threads too, so a slow client
+                // cannot stall the accept loop.
+                let busy = previous >= MAX_CONNECTIONS;
+                let config = if busy {
+                    None
+                } else {
+                    Some(Arc::clone(&config))
+                };
                 let counter = Arc::clone(&active);
+                let name = if busy {
+                    "helloworld-reject"
+                } else {
+                    "helloworld-conn"
+                };
                 let spawned = thread::Builder::new()
-                    .name("helloworld-conn".to_string())
+                    .name(name.to_string())
                     .stack_size(HANDLER_STACK)
                     .spawn(move || {
                         let _guard = ActiveGuard(counter);
-                        if let Err(err) = handle_connection(stream, &config) {
-                            eprintln!("helloworld: connection error: {err}");
+                        match config {
+                            Some(config) => {
+                                if let Err(err) = handle_connection(stream, &config) {
+                                    if !is_disconnect(&err) {
+                                        eprintln!("helloworld: connection error: {err}");
+                                    }
+                                }
+                            }
+                            None => reject_busy(stream),
                         }
                     });
                 if let Err(err) = spawned {
@@ -130,7 +153,7 @@ pub fn serve(listener: TcpListener, config: Arc<Config>) {
     }
 }
 
-/// Decrements the active-connection counter when the handler thread ends.
+/// Decrements the active-thread counter when a worker thread ends.
 struct ActiveGuard(Arc<AtomicUsize>);
 
 impl Drop for ActiveGuard {
@@ -158,13 +181,18 @@ fn reject_busy(mut stream: TcpStream) {
 ///
 /// The half-close lets the client see the complete response even while it is still
 /// sending a request body, and draining whatever it sends prevents a TCP reset from
-/// discarding the response before the client has read it.
+/// discarding the response before the client has read it. Draining stops after
+/// [`LINGER_TIMEOUT`] in total, or after [`MAX_LINGER_BYTES`] bytes.
 fn lingering_close(mut stream: TcpStream) {
     let _ = stream.shutdown(Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(LINGER_TIMEOUT));
+    let deadline = Instant::now() + LINGER_TIMEOUT;
     let mut scratch = [0_u8; 4096];
     let mut drained = 0_usize;
     while drained < MAX_LINGER_BYTES {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+            break;
+        }
         match stream.read(&mut scratch) {
             Ok(0) | Err(_) => break,
             Ok(read) => drained += read,
@@ -191,8 +219,8 @@ fn handle_connection(stream: TcpStream, config: &Config) -> std::io::Result<()> 
         Ok(Some(info)) => log(peer, &info, started.elapsed()),
         Ok(None) => {}
         Err(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
-            // A socket read timeout means the head never arrived in time; answer
-            // 408 instead of surfacing an error the client never sees.
+            // A socket read timeout means the request never arrived in time;
+            // answer 408 instead of surfacing an error the client never sees.
             if let Some(info) = answer_timeout(&mut writer) {
                 log(peer, &info, started.elapsed());
             }
@@ -201,6 +229,20 @@ fn handle_connection(stream: TcpStream, config: &Config) -> std::io::Result<()> 
     }
     lingering_close(writer);
     Ok(())
+}
+
+/// Whether `err` is a client that went away rather than a server fault.
+///
+/// A client that resets or half-closes its side mid-request is normal traffic,
+/// so those errors are not worth logging.
+fn is_disconnect(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+    )
 }
 
 /// Write the `408 Request Timeout` response and describe it.
@@ -258,7 +300,7 @@ fn read_line<R: BufRead>(reader: &mut R, limit: usize, buf: &mut Vec<u8>) -> io:
     Ok(ReadLine::Line(String::from_utf8_lossy(buf).to_string()))
 }
 
-/// Arms the read deadline before each blocking read of the request head.
+/// Arms the read deadline before each blocking read of the request.
 trait Deadline {
     /// Arm the deadline; fails once it has already passed.
     fn arm(&mut self) -> io::Result<()>;
@@ -297,8 +339,8 @@ impl Deadline for SocketDeadline {
 ///
 /// Returns `None` when the peer closed the connection before sending a request
 /// line, and otherwise the description of what was served. `deadline` bounds the
-/// whole request head (and the body drain), so a client that stalls mid-head is
-/// answered with `408` rather than holding a thread.
+/// whole request, so a client that trickles the head or the body is answered with
+/// `408` rather than holding a thread.
 fn handle<R: BufRead, W: Write, D: Deadline>(
     reader: &mut R,
     writer: &mut W,
@@ -343,22 +385,29 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
         }
     };
 
-    if method.is_empty() || !method.bytes().all(|b| b.is_ascii_graphic()) || target.is_empty() {
+    // Absolute-form targets are accepted (RFC 7230 5.3.2); routing and
+    // logging use the origin-form path only.
+    let path = origin_path(target)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let head_only = method == "HEAD";
+    if !is_token(method) || target.is_empty() || target.bytes().any(|b| b.is_ascii_control()) {
         return fail(
             writer,
             method,
-            "-",
+            &path,
             "400 Bad Request",
             "bad request\n",
-            false,
+            head_only,
         );
     }
-    let head_only = method == "HEAD";
     if !version.starts_with("HTTP/") {
         return fail(
             writer,
             method,
-            target,
+            &path,
             "400 Bad Request",
             "bad request\n",
             head_only,
@@ -368,7 +417,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
         return fail(
             writer,
             method,
-            target,
+            &path,
             "505 HTTP Version Not Supported",
             "http version not supported\n",
             head_only,
@@ -391,7 +440,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                 return fail(
                     writer,
                     method,
-                    target,
+                    &path,
                     "431 Request Header Fields Too Large",
                     "headers too large\n",
                     head_only,
@@ -406,27 +455,62 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                     return fail(
                         writer,
                         method,
-                        target,
+                        &path,
                         "431 Request Header Fields Too Large",
                         "headers too large\n",
                         head_only,
                     );
                 }
-                if let Some((name, value)) = line.split_once(':') {
-                    let name = name.trim().to_ascii_lowercase();
-                    let valid = !name.is_empty()
-                        && !name
-                            .chars()
-                            .any(|c| c.is_ascii_whitespace() || c.is_control());
-                    if valid {
-                        headers.push((name, value.trim().to_string()));
-                    }
+                // An obsolete folded line starts with SP or HTAB (RFC 7230
+                // 3.2.4); reject it instead of misreading it as a field.
+                if line.starts_with([' ', '\t']) {
+                    return fail(
+                        writer,
+                        method,
+                        &path,
+                        "400 Bad Request",
+                        "bad request\n",
+                        head_only,
+                    );
                 }
+                let Some((name, value)) = line.split_once(':') else {
+                    return fail(
+                        writer,
+                        method,
+                        &path,
+                        "400 Bad Request",
+                        "bad request\n",
+                        head_only,
+                    );
+                };
+                // No whitespace is allowed before the colon, and the field name
+                // must be a token (RFC 7230 3.2.4, 3.2.6).
+                if !is_token(name) {
+                    return fail(
+                        writer,
+                        method,
+                        &path,
+                        "400 Bad Request",
+                        "bad request\n",
+                        head_only,
+                    );
+                }
+                // Field values are VCHAR / obs-text: control characters other
+                // than HTAB are malformed.
+                if value.bytes().any(|b| b.is_ascii_control() && b != b'\t') {
+                    return fail(
+                        writer,
+                        method,
+                        &path,
+                        "400 Bad Request",
+                        "bad request\n",
+                        head_only,
+                    );
+                }
+                headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
             }
         }
     }
-
-    let path = target.split(['?', '#']).next().unwrap_or("").to_string();
 
     // A body is drained, never buffered, so a chunked request is unsupported.
     if header(&headers, "transfer-encoding").is_some() {
@@ -494,10 +578,13 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
     }
 
     match header(&headers, "expect") {
-        Some(value) if value.eq_ignore_ascii_case("100-continue") => {
+        // An HTTP/1.0 client cannot understand 1xx; ignore the expectation
+        // (RFC 7231 5.1.1) and read the body as usual.
+        Some(value) if version == "HTTP/1.1" && value.eq_ignore_ascii_case("100-continue") => {
             writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
             writer.flush()?;
         }
+        Some(value) if value.eq_ignore_ascii_case("100-continue") => {}
         Some(_) => {
             return fail(
                 writer,
@@ -511,16 +598,24 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
         None => {}
     }
 
-    if let Err(err) = deadline.arm() {
-        return match err.kind() {
-            ErrorKind::TimedOut | ErrorKind::WouldBlock => Ok(answer_timeout(writer)),
-            _ => Err(err),
-        };
+    // Drain the body, re-arming the deadline before every chunk so a client
+    // that trickles the body cannot hold the connection open.
+    let mut remaining = content_length.unwrap_or(0);
+    let mut scratch = [0_u8; 8192];
+    while remaining > 0 {
+        if let Err(err) = deadline.arm() {
+            return match err.kind() {
+                ErrorKind::TimedOut | ErrorKind::WouldBlock => Ok(answer_timeout(writer)),
+                _ => Err(err),
+            };
+        }
+        let read = (&mut *reader).take(remaining).read(&mut scratch)?;
+        if read == 0 {
+            break;
+        }
+        remaining -= read as u64;
     }
-    let len = content_length.unwrap_or(0);
-    let mut limited = (&mut *reader).take(len);
-    let copied = io::copy(&mut limited, &mut io::sink())?;
-    if copied != len {
+    if remaining != 0 {
         return fail(
             writer,
             method,
@@ -655,6 +750,34 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .iter()
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.as_str())
+}
+
+/// Whether `name` is a valid HTTP `token` (RFC 7230 3.2.6).
+fn is_token(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// Strip an absolute-form request target down to its origin-form path.
+///
+/// A server must accept absolute-form targets (RFC 7230 5.3.2); the scheme and
+/// authority are ignored, and the path is routed and logged as usual.
+fn origin_path(target: &str) -> &str {
+    let rest = ["http://", "https://"].iter().find_map(|scheme| {
+        target
+            .get(..scheme.len())
+            .filter(|head| head.eq_ignore_ascii_case(scheme))
+            .map(|_| &target[scheme.len()..])
+    });
+    match rest {
+        Some(rest) => match rest.find(['/', '?', '#']) {
+            Some(index) => &rest[index..],
+            None => "/",
+        },
+        None => target,
+    }
 }
 
 /// Whether the `Host` header(s) satisfy the request's HTTP version.
@@ -1301,5 +1424,221 @@ mod tests {
         );
         assert_eq!(info.expect("served").status, "200 OK");
         assert_eq!(body(&response), "Hello, World!\n");
+    }
+
+    /// Deadline that expires after a fixed number of `arm` calls.
+    struct CountdownDeadline {
+        /// Arms left before the deadline expires.
+        arms: usize,
+    }
+
+    impl Deadline for CountdownDeadline {
+        fn arm(&mut self) -> io::Result<()> {
+            if self.arms == 0 {
+                return Err(io::Error::new(ErrorKind::TimedOut, "test"));
+            }
+            self.arms -= 1;
+            Ok(())
+        }
+    }
+
+    /// Reader that hands out one byte per read, like a client trickling a body.
+    struct Trickle {
+        /// Bytes still to hand out.
+        data: Vec<u8>,
+        /// Offset of the next byte.
+        pos: usize,
+    }
+
+    impl Trickle {
+        /// Build a reader over `data`.
+        fn new(data: Vec<u8>) -> Self {
+            Self { data, pos: 0 }
+        }
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.data.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = self.data[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    impl BufRead for Trickle {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Ok(&self.data[self.pos.min(self.data.len())..(self.pos + 1).min(self.data.len())])
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.pos = (self.pos + amount).min(self.data.len());
+        }
+    }
+
+    #[test]
+    fn slow_body_is_request_timeout() {
+        let body = "x".repeat(100);
+        let request =
+            format!("GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{body}");
+        let mut reader = BufReader::new(Trickle::new(request.into_bytes()));
+        let mut writer = Vec::new();
+        let info = handle(
+            &mut reader,
+            &mut writer,
+            &default_config(),
+            &mut CountdownDeadline { arms: 5 },
+        )
+        .expect("handle must succeed")
+        .expect("served");
+        assert_eq!(info.status, "408 Request Timeout");
+    }
+
+    #[test]
+    fn lingering_close_gives_up_after_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let (done, finished) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            lingering_close(server);
+            done.send(()).expect("send");
+        });
+        // Keep the read side fed so only the deadline can stop the drain.
+        let started = Instant::now();
+        let mut closed = false;
+        while started.elapsed() < Duration::from_secs(2) {
+            if finished.try_recv().is_ok() {
+                closed = true;
+                break;
+            }
+            if client.write_all(b"x").is_err() {
+                // The drain gave up and closed the socket.
+                closed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(closed, "lingering_close drained past LINGER_TIMEOUT");
+        handle.join().expect("join");
+    }
+
+    #[test]
+    fn whitespace_before_colon_is_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost : localhost\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn obs_fold_is_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nX-A: 1\r\n folded\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn control_character_in_header_value_is_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nX-A: a\u{1}b\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn non_token_header_name_is_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nX A: 1\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn header_line_without_colon_is_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nnope\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn http10_ignores_expect_100_continue() {
+        let (response, info) = run(
+            "GET / HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "200 OK");
+        assert!(
+            !response.starts_with("HTTP/1.1 100 Continue"),
+            "response was {response:?}"
+        );
+        assert_eq!(body(&response), "Hello, World!\n");
+    }
+
+    #[test]
+    fn absolute_form_target_is_routed_by_path() {
+        let (response, info) = run(
+            "GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        let info = info.expect("served");
+        assert_eq!(info.status, "200 OK");
+        assert_eq!(info.path, "/");
+        assert_eq!(body(&response), "Hello, World!\n");
+    }
+
+    #[test]
+    fn absolute_form_without_path_serves_root() {
+        let (_, info) = run(
+            "GET http://localhost HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "200 OK");
+    }
+
+    #[test]
+    fn origin_path_strips_scheme_and_authority() {
+        assert_eq!(origin_path("http://example.com/a?b#c"), "/a?b#c");
+        assert_eq!(origin_path("https://example.com"), "/");
+        assert_eq!(origin_path("HTTP://example.com/x"), "/x");
+        assert_eq!(origin_path("/plain?q=1"), "/plain?q=1");
+        assert_eq!(origin_path("*"), "*");
+    }
+
+    #[test]
+    fn is_token_matches_rfc_tokens() {
+        assert!(is_token("Host"));
+        assert!(is_token("x-!#$%&'*+-.^_`|~"));
+        assert!(!is_token(""));
+        assert!(!is_token("X A"));
+        assert!(!is_token("X:"));
+    }
+
+    #[test]
+    fn non_token_method_is_bad_request() {
+        let (_, info) = run(
+            "GET@ / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn control_character_in_target_is_bad_request() {
+        let (_, info) = run(
+            "GET /\u{1} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
     }
 }
