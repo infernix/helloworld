@@ -67,6 +67,12 @@ const LOG_QUEUE: usize = 256;
 /// `Server` response header value.
 const SERVER: &str = concat!("helloworld/", env!("CARGO_PKG_VERSION"));
 
+/// `Vary` value for responses whose body does not depend on the request's language.
+const VARY_ENCODING: &str = "Accept-Encoding";
+
+/// `Vary` value for `/` catalog responses, which negotiate `Accept-Language`.
+const VARY_LANGUAGE: &str = "Accept-Language, Accept-Encoding";
+
 /// Weekday names for IMF-fixdate formatting, indexed by day of week.
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -242,7 +248,16 @@ fn reject_busy(stream: &TcpStream, logger: &Logger, started: Instant) {
     let peer = stream.peer_addr().ok();
     let info = RequestInfo::new("-", "-", "-", "503 Service Unavailable");
     let mut writer = stream;
-    if respond(&mut writer, info.status, &[("Retry-After", "1")], "", false).is_ok() {
+    if respond(
+        &mut writer,
+        info.status,
+        VARY_ENCODING,
+        &[("Retry-After", "1")],
+        "",
+        false,
+    )
+    .is_ok()
+    {
         logger.send(log_line(peer, &info, started.elapsed()));
     }
     lingering_close(stream);
@@ -349,6 +364,7 @@ fn answer_timeout<W: Write>(writer: &mut W, head_only: bool) -> Option<RequestIn
         RequestInfo::new("-", "-", "-", "408 Request Timeout"),
         "request timeout\n",
         &[],
+        VARY_ENCODING,
         head_only,
     )
     .ok()
@@ -501,6 +517,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                     "-",
                     "414 URI Too Long",
                     "request line too long\n",
+                    VARY_ENCODING,
                     head_only,
                 );
             }
@@ -524,6 +541,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                 "-",
                 "400 Bad Request",
                 "bad request\n",
+                VARY_ENCODING,
                 head_only,
             );
         }
@@ -540,6 +558,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             &path,
             "400 Bad Request",
             "bad request\n",
+            VARY_ENCODING,
             head_only,
         );
     }
@@ -550,6 +569,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             &path,
             "400 Bad Request",
             "bad request\n",
+            VARY_ENCODING,
             head_only,
         );
     }
@@ -560,6 +580,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             &path,
             "400 Bad Request",
             "bad request\n",
+            VARY_ENCODING,
             head_only,
         );
     }
@@ -570,6 +591,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             &path,
             "505 HTTP Version Not Supported",
             "http version not supported\n",
+            VARY_ENCODING,
             head_only,
         );
     };
@@ -588,6 +610,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                     &path,
                     "431 Request Header Fields Too Large",
                     "headers too large\n",
+                    VARY_ENCODING,
                     head_only,
                 );
             }
@@ -603,6 +626,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                         &path,
                         "431 Request Header Fields Too Large",
                         "headers too large\n",
+                        VARY_ENCODING,
                         head_only,
                     );
                 }
@@ -615,6 +639,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                         &path,
                         "400 Bad Request",
                         "bad request\n",
+                        VARY_ENCODING,
                         head_only,
                     );
                 }
@@ -625,6 +650,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                         &path,
                         "400 Bad Request",
                         "bad request\n",
+                        VARY_ENCODING,
                         head_only,
                     );
                 };
@@ -637,6 +663,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                         &path,
                         "400 Bad Request",
                         "bad request\n",
+                        VARY_ENCODING,
                         head_only,
                     );
                 }
@@ -649,6 +676,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                         &path,
                         "400 Bad Request",
                         "bad request\n",
+                        VARY_ENCODING,
                         head_only,
                     );
                 }
@@ -666,6 +694,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             &path,
             "400 Bad Request",
             "bad request\n",
+            VARY_ENCODING,
             head_only,
         );
     }
@@ -678,6 +707,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             &path,
             "501 Not Implemented",
             "not implemented\n",
+            VARY_ENCODING,
             head_only,
         );
     }
@@ -692,6 +722,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                 &path,
                 "400 Bad Request",
                 "bad request\n",
+                VARY_ENCODING,
                 head_only,
             );
         }
@@ -705,6 +736,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                     &path,
                     "400 Bad Request",
                     "bad request\n",
+                    VARY_ENCODING,
                     head_only,
                 );
             }
@@ -722,6 +754,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                     &path,
                     "413 Payload Too Large",
                     "payload too large\n",
+                    VARY_ENCODING,
                     head_only,
                 );
             }
@@ -735,6 +768,22 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             &path,
             "413 Payload Too Large",
             "payload too large\n",
+            VARY_ENCODING,
+            head_only,
+        );
+    }
+
+    // The response carries no content coding, so a client that refuses
+    // `identity` has no acceptable representation (RFC 9110 12.5.3). Reject
+    // before the body is invited with `100 Continue`.
+    if !identity_is_acceptable(&headers) {
+        return fail(
+            writer,
+            method,
+            &path,
+            "406 Not Acceptable",
+            "not acceptable\n",
+            VARY_ENCODING,
             head_only,
         );
     }
@@ -754,6 +803,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                 &path,
                 "417 Expectation Failed",
                 "expectation failed\n",
+                VARY_ENCODING,
                 head_only,
             );
         }
@@ -784,24 +834,33 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             &path,
             "400 Bad Request",
             "bad request\n",
+            VARY_ENCODING,
             head_only,
         );
     }
 
-    let (status, lang, body, extra): (
+    let (status, lang, body, extra, vary): (
         &'static str,
         String,
         String,
         Vec<(&'static str, &'static str)>,
+        &'static str,
     ) = match method {
         "GET" | "HEAD" => match path.as_str() {
             "/" => greeting(config, &headers),
-            "/healthz" => ("200 OK", "-".to_string(), "ok\n".to_string(), Vec::new()),
+            "/healthz" => (
+                "200 OK",
+                "-".to_string(),
+                "ok\n".to_string(),
+                Vec::new(),
+                VARY_ENCODING,
+            ),
             _ => (
                 "404 Not Found",
                 "-".to_string(),
                 "not found\n".to_string(),
                 Vec::new(),
+                VARY_ENCODING,
             ),
         },
         _ => (
@@ -809,6 +868,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             "-".to_string(),
             "method not allowed\n".to_string(),
             vec![("Allow", "GET, HEAD")],
+            VARY_ENCODING,
         ),
     };
 
@@ -817,6 +877,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
         RequestInfo::new(method, &path, &lang, status),
         &body,
         &extra,
+        vary,
         head_only,
     )
 }
@@ -844,19 +905,23 @@ fn reply<W: Write>(
     info: RequestInfo,
     body: &str,
     extra: &[(&str, &str)],
+    vary: &str,
     head_only: bool,
 ) -> Result<Option<RequestInfo>, Failure> {
-    respond(writer, info.status, extra, body, head_only)?;
+    respond(writer, info.status, vary, extra, body, head_only)?;
     Ok(Some(info))
 }
 
 /// Reject a request before routing, logging `-` as its language.
+///
+/// `vary` is written as the response's `Vary` value, as in [`reply`].
 fn fail<W: Write>(
     writer: &mut W,
     method: &str,
     path: &str,
     status: &'static str,
     body: &str,
+    vary: &str,
     head_only: bool,
 ) -> Result<Option<RequestInfo>, Failure> {
     reply(
@@ -864,17 +929,20 @@ fn fail<W: Write>(
         RequestInfo::new(method, path, "-", status),
         body,
         &[],
+        vary,
         head_only,
     )
 }
 
-/// Resolve the greeting and response headers for a request.
+/// Resolve the greeting, response headers and `Vary` value for a request.
 ///
 /// Follows the documented precedence: `--text`, then `--lang`, then
-/// `Accept-Language`, then the default. `Content-Language` (and `Vary` for
-/// negotiation) reflects the language actually served; `--text` serves a fixed
-/// string, so it advertises neither. A header that leaves no catalog language
-/// acceptable is answered with `406 Not Acceptable`.
+/// `Accept-Language`, then the default. `Content-Language` reflects the language
+/// actually served, while `Vary` names the request headers the body depends on:
+/// catalog responses vary on `Accept-Language` and `Accept-Encoding`, and
+/// `--lang`/`--text` responses on `Accept-Encoding` alone. `--text` serves a
+/// fixed string, so it advertises no `Content-Language`. A header that leaves no
+/// catalog language acceptable is answered with `406 Not Acceptable`.
 fn greeting(
     config: &Config,
     headers: &[(String, String)],
@@ -883,11 +951,18 @@ fn greeting(
     String,
     String,
     Vec<(&'static str, &'static str)>,
+    &'static str,
 ) {
     if let Some(text) = &config.text {
         let mut body = text.clone();
         body.push('\n');
-        return ("200 OK", "custom".to_string(), body, Vec::new());
+        return (
+            "200 OK",
+            "custom".to_string(),
+            body,
+            Vec::new(),
+            VARY_ENCODING,
+        );
     }
     if let Some(code) = config.lang {
         return (
@@ -895,6 +970,7 @@ fn greeting(
             code.to_string(),
             format!("{}\n", i18n::greeting_for(code)),
             vec![("Content-Language", code)],
+            VARY_ENCODING,
         );
     }
     let combined = combined_header(headers, "accept-language");
@@ -903,13 +979,15 @@ fn greeting(
             "200 OK",
             code.to_string(),
             format!("{}\n", i18n::greeting_for(code)),
-            vec![("Content-Language", code), ("Vary", "Accept-Language")],
+            vec![("Content-Language", code)],
+            VARY_LANGUAGE,
         ),
         i18n::Negotiated::NotAcceptable => (
             "406 Not Acceptable",
             "-".to_string(),
             "not acceptable\n".to_string(),
-            vec![("Vary", "Accept-Language")],
+            Vec::new(),
+            VARY_LANGUAGE,
         ),
     }
 }
@@ -1023,8 +1101,10 @@ fn line_method(buf: &[u8]) -> String {
 
 /// Whether the `Host` header(s) satisfy the request's HTTP version.
 ///
-/// HTTP/1.1 requires exactly one non-empty, ASCII-graphic `Host`; HTTP/1.0 makes
-/// it optional but still rejects duplicates.
+/// HTTP/1.1 requires exactly one non-empty `Host` whose value is a valid
+/// `uri-host [ ":" port ]` (RFC 9110 7.2); HTTP/1.0 makes the field optional,
+/// but a value that is present must still be a valid authority. Duplicates are
+/// rejected for both versions.
 fn host_is_valid(version: Version, headers: &[(String, String)]) -> bool {
     let mut host = None;
     let mut count = 0_usize;
@@ -1035,16 +1115,108 @@ fn host_is_valid(version: Version, headers: &[(String, String)]) -> bool {
     if count > 1 {
         return false;
     }
-    if version == Version::Http10 {
-        return true;
+    match host {
+        None => version == Version::Http10,
+        Some(value) => !value.is_empty() && authority_is_valid(value),
     }
-    host.is_some_and(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_graphic()))
 }
 
-/// Serialize one response: status line, fixed headers, extras, then the body.
+/// Whether `value` is a `uri-host [ ":" port ]` (RFC 9110 7.2).
+///
+/// The bracketed form is an IP-literal: `[`, a non-empty run of URI bytes
+/// (letters, digits, `:`, and the unreserved and sub-delimiter punctuation), `]`,
+/// and an optional `:` followed by digits. Otherwise the value is a `reg-name`
+/// with an optional trailing `:port`, where `port` is `*DIGIT` so an empty port
+/// is allowed; a `:` anywhere else in the host makes the value invalid.
+fn authority_is_valid(value: &str) -> bool {
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some(close) = rest.find(']') else {
+            return false;
+        };
+        let literal = &rest[..close];
+        if literal.is_empty()
+            || !literal
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b":.%_-~!$&'()*+,;=".contains(&b))
+        {
+            return false;
+        }
+        let tail = &rest[close + 1..];
+        return tail.is_empty()
+            || tail
+                .strip_prefix(':')
+                .is_some_and(|port| port.bytes().all(|b| b.is_ascii_digit()));
+    }
+    let host = match value.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => value,
+    };
+    !host.contains(':') && reg_name_is_valid(host)
+}
+
+/// Whether `host` is a `reg-name` (RFC 3986 3.2.2).
+///
+/// Every byte is an unreserved or sub-delimiter ASCII character, and every `%`
+/// introduces a two-digit hexadecimal percent-escape.
+fn reg_name_is_valid(host: &str) -> bool {
+    let bytes = host.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        if !(byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&byte)) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Whether the request accepts the `identity` content coding.
+///
+/// The response carries no content coding, so `identity` is acceptable by default
+/// and is refused only when the `Accept-Encoding` list rules it out (RFC 9110
+/// 12.5.3): an `identity` entry with weight zero, or a `*` entry with weight zero
+/// and no `identity` entry at all. The coding list is parsed by
+/// [`i18n::parse_weighted_list`], so a malformed weight drops its entry and a
+/// later entry for the same coding overrides an earlier one. An absent or empty
+/// header accepts `identity`.
+fn identity_is_acceptable(headers: &[(String, String)]) -> bool {
+    let Some(combined) = combined_header(headers, "accept-encoding") else {
+        return true;
+    };
+    let mut identity: Option<f32> = None;
+    let mut wildcard: Option<f32> = None;
+    for (weight, coding) in i18n::parse_weighted_list(&combined) {
+        if coding.eq_ignore_ascii_case("identity") {
+            identity = Some(weight);
+        } else if coding == "*" {
+            wildcard = Some(weight);
+        }
+    }
+    match identity.or(wildcard) {
+        Some(weight) => weight > 0.0,
+        None => true,
+    }
+}
+
+/// Serialize one response: status line, fixed headers, `Vary`, extras, then the body.
+///
+/// `vary` is written as the single `Vary` field of every final response, so the
+/// cache key always covers the request headers the response was derived from.
 fn respond<W: Write>(
     writer: &mut W,
     status: &str,
+    vary: &str,
     extra: &[(&str, &str)],
     body: &str,
     head_only: bool,
@@ -1058,7 +1230,9 @@ fn respond<W: Write>(
     response.push_str(SERVER);
     response.push_str("\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ");
     response.push_str(&body.len().to_string());
-    response.push_str("\r\nConnection: close\r\n");
+    response.push_str("\r\nConnection: close\r\nVary: ");
+    response.push_str(vary);
+    response.push_str("\r\n");
     for (name, value) in extra {
         response.push_str(name);
         response.push_str(": ");
@@ -1266,6 +1440,11 @@ mod tests {
             let (key, value) = line.split_once(':')?;
             (key.trim() == name).then(|| value.trim())
         })
+    }
+
+    /// One `accept-encoding` request header carrying `value`.
+    fn accept_encoding(value: &str) -> Vec<(String, String)> {
+        vec![("accept-encoding".to_string(), value.to_string())]
     }
 
     /// Deadline that is already expired, forcing the `408` path.
@@ -1489,6 +1668,66 @@ mod tests {
     }
 
     #[test]
+    fn authority_is_valid_accepts_valid_hosts() {
+        for host in [
+            "example.com",
+            "example.com:8080",
+            "127.0.0.1",
+            "127.0.0.1:21212",
+            "[::1]",
+            "[::1]:21212",
+            "[2001:db8::1]",
+            "[fe80::1%25eth0]",
+            "[fe80::1%eth0]",
+            "xn--nqv7f.example",
+            "EXAMPLE.COM.",
+            "a,b",
+            "_dmarc.example.com",
+            ":21212",
+            "example.com:",
+            "%41.example",
+            "localhost",
+        ] {
+            assert!(authority_is_valid(host), "should accept {host:?}");
+        }
+    }
+
+    #[test]
+    fn authority_is_valid_rejects_invalid_hosts() {
+        for host in [
+            "user@host",
+            "[::1",
+            "[]",
+            "[a/b]",
+            "a:1:2",
+            "%zz",
+            "%4",
+            "a@b:80",
+            "[::1]:x",
+            "[::1]x",
+        ] {
+            assert!(!authority_is_valid(host), "should reject {host:?}");
+        }
+    }
+
+    #[test]
+    fn host_with_userinfo_is_bad_request() {
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: user@host\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+        assert_eq!(body(&response), "bad request\n");
+    }
+
+    #[test]
+    fn host_with_unterminated_bracket_is_bad_request() {
+        let (response, info) = run("GET / HTTP/1.1\r\nHost: [::1\r\n\r\n", &default_config());
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+        assert_eq!(body(&response), "bad request\n");
+    }
+
+    #[test]
     fn unexpected_expectation_is_417() {
         let (response, info) = run(
             "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: nope\r\n\r\n",
@@ -1600,6 +1839,7 @@ mod tests {
         let response = String::from_utf8(writer).expect("response must be utf-8");
         assert!(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
         assert_eq!(body(&response), "request timeout\n");
+        assert_eq!(header_value(&response, "Vary"), Some("Accept-Encoding"));
     }
 
     #[test]
@@ -1632,7 +1872,10 @@ mod tests {
         assert_eq!(info.status, "406 Not Acceptable");
         assert_eq!(info.lang, "-");
         assert_eq!(body(&response), "not acceptable\n");
-        assert_eq!(header_value(&response, "Vary"), Some("Accept-Language"));
+        assert_eq!(
+            header_value(&response, "Vary"),
+            Some("Accept-Language, Accept-Encoding")
+        );
         assert_eq!(header_value(&response, "Content-Language"), None);
     }
 
@@ -1644,28 +1887,21 @@ mod tests {
         );
         assert_eq!(info.expect("served").status, "200 OK");
         assert_eq!(header_value(&response, "Content-Language"), Some("de"));
-        assert_eq!(header_value(&response, "Vary"), Some("Accept-Language"));
-    }
-
-    #[test]
-    fn negotiated_route_advertises_language_and_vary() {
-        let (response, _) = run(
-            "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: de\r\n\r\n",
-            &default_config(),
+        assert_eq!(
+            header_value(&response, "Vary"),
+            Some("Accept-Language, Accept-Encoding")
         );
-        assert_eq!(header_value(&response, "Content-Language"), Some("de"));
-        assert_eq!(header_value(&response, "Vary"), Some("Accept-Language"));
     }
 
     #[test]
-    fn configured_language_advertises_only_content_language() {
+    fn configured_language_advertises_content_language_and_encoding() {
         let config = Config {
             lang: Some("nl"),
             text: None,
         };
         let (response, _) = run("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", &config);
         assert_eq!(header_value(&response, "Content-Language"), Some("nl"));
-        assert_eq!(header_value(&response, "Vary"), None);
+        assert_eq!(header_value(&response, "Vary"), Some("Accept-Encoding"));
     }
 
     #[test]
@@ -1676,7 +1912,7 @@ mod tests {
         };
         let (response, _) = run("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", &config);
         assert_eq!(header_value(&response, "Content-Language"), None);
-        assert_eq!(header_value(&response, "Vary"), None);
+        assert_eq!(header_value(&response, "Vary"), Some("Accept-Encoding"));
     }
 
     #[test]
@@ -1686,14 +1922,64 @@ mod tests {
             &default_config(),
         );
         assert_eq!(header_value(&health, "Content-Language"), None);
-        assert_eq!(header_value(&health, "Vary"), None);
+        assert_eq!(header_value(&health, "Vary"), Some("Accept-Encoding"));
 
         let (missing, _) = run(
             "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n",
             &default_config(),
         );
         assert_eq!(header_value(&missing, "Content-Language"), None);
-        assert_eq!(header_value(&missing, "Vary"), None);
+        assert_eq!(header_value(&missing, "Vary"), Some("Accept-Encoding"));
+    }
+
+    #[test]
+    fn identity_is_acceptable_honours_the_coding_list() {
+        assert!(identity_is_acceptable(&[]));
+        assert!(identity_is_acceptable(&accept_encoding("")));
+        assert!(identity_is_acceptable(&accept_encoding("gzip")));
+        assert!(identity_is_acceptable(&accept_encoding("gzip;q=0")));
+        assert!(identity_is_acceptable(&accept_encoding("identity")));
+        assert!(identity_is_acceptable(&accept_encoding("identity;q=1")));
+        assert!(identity_is_acceptable(&accept_encoding("*;q=0, identity")));
+        assert!(identity_is_acceptable(&accept_encoding(
+            "identity;q=0, identity;q=1"
+        )));
+        assert!(identity_is_acceptable(&accept_encoding("identity;q=bogus")));
+
+        assert!(!identity_is_acceptable(&accept_encoding("identity;q=0")));
+        assert!(!identity_is_acceptable(&accept_encoding("*;q=0")));
+        assert!(!identity_is_acceptable(&accept_encoding("gzip, *;q=0")));
+        assert!(!identity_is_acceptable(&accept_encoding(
+            "identity;q=0, *;q=1"
+        )));
+    }
+
+    #[test]
+    fn identity_refusal_is_406() {
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity;q=0\r\n\r\n",
+            &default_config(),
+        );
+        let info = info.expect("served");
+        assert_eq!(info.status, "406 Not Acceptable");
+        assert_eq!(info.lang, "-");
+        assert_eq!(body(&response), "not acceptable\n");
+        assert_eq!(header_value(&response, "Vary"), Some("Accept-Encoding"));
+        assert_eq!(header_value(&response, "Content-Language"), None);
+    }
+
+    #[test]
+    fn encoding_that_accepts_identity_is_200() {
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "200 OK");
+        assert_eq!(body(&response), "Hello, World!\n");
+        assert_eq!(
+            header_value(&response, "Vary"),
+            Some("Accept-Language, Accept-Encoding")
+        );
     }
 
     #[test]
@@ -1758,6 +2044,10 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 503"), "was {response:?}");
         reader.read_to_string(&mut response).expect("read body");
         assert!(response.contains("Retry-After: 1"), "was {response:?}");
+        assert!(
+            response.contains("Vary: Accept-Encoding"),
+            "was {response:?}"
+        );
         assert_eq!(body(&response), "", "was {response:?}");
 
         let line = lines

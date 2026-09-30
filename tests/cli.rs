@@ -254,7 +254,10 @@ fn get_root_defaults_to_english() {
     assert_eq!(status(&response), "HTTP/1.1 200 OK");
     assert_eq!(header(&response, "Content-Length"), Some("14"));
     assert_eq!(header(&response, "Content-Language"), Some("en"));
-    assert_eq!(header(&response, "Vary"), Some("Accept-Language"));
+    assert_eq!(
+        header(&response, "Vary"),
+        Some("Accept-Language, Accept-Encoding")
+    );
     assert_eq!(body(&response), "Hello, World!\n");
 }
 
@@ -279,8 +282,35 @@ fn unacceptable_accept_language_is_406() {
     );
     assert_eq!(status(&response), "HTTP/1.1 406 Not Acceptable");
     assert_eq!(body(&response), "not acceptable\n");
-    assert_eq!(header(&response, "Vary"), Some("Accept-Language"));
+    assert_eq!(
+        header(&response, "Vary"),
+        Some("Accept-Language, Accept-Encoding")
+    );
     assert_eq!(header(&response, "Content-Language"), None);
+}
+
+#[test]
+fn identity_refusal_is_406() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity;q=0\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 406 Not Acceptable");
+    assert_eq!(body(&response), "not acceptable\n");
+    assert_eq!(header(&response, "Vary"), Some("Accept-Encoding"));
+    assert_eq!(header(&response, "Content-Language"), None);
+}
+
+#[test]
+fn encoding_that_accepts_identity_is_200() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(body(&response), "Hello, World!\n");
 }
 
 #[test]
@@ -292,7 +322,7 @@ fn lang_flag_wins_over_accept_language() {
     );
     assert_eq!(body(&response), "Hallo, wereld!\n");
     assert_eq!(header(&response, "Content-Language"), Some("nl"));
-    assert_eq!(header(&response, "Vary"), None);
+    assert_eq!(header(&response, "Vary"), Some("Accept-Encoding"));
 }
 
 #[test]
@@ -304,7 +334,7 @@ fn text_flag_replaces_the_greeting() {
     );
     assert_eq!(body(&response), "Hi there\n");
     assert_eq!(header(&response, "Content-Language"), None);
-    assert_eq!(header(&response, "Vary"), None);
+    assert_eq!(header(&response, "Vary"), Some("Accept-Encoding"));
 }
 
 #[test]
@@ -459,6 +489,17 @@ fn http11_without_host_is_400() {
     let server = Server::start(&[]);
     let response = request(server.port, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
     assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
+fn invalid_host_is_400() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: user@host\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+    assert_eq!(body(&response), "bad request\n");
 }
 
 #[test]
@@ -698,6 +739,7 @@ fn over_capacity_returns_503() {
     }
     assert_eq!(status(&response), "HTTP/1.1 503 Service Unavailable");
     assert_eq!(header(&response, "Retry-After"), Some("1"));
+    assert_eq!(header(&response, "Vary"), Some("Accept-Encoding"));
     // The rejection is bodyless, so it is also correct for `HEAD`.
     assert_eq!(body(&response), "");
     // Every probe before the rejection is logged too, so drain until the 503 line.

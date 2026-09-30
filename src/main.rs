@@ -174,6 +174,11 @@ fn parse_args(argv: &[String]) -> Result<Command, String> {
             }
             "-p" | "--port" => {
                 let value = flag_value(argv, &mut index, name, inline)?;
+                // A port is `1*DIGIT`; reject the sign that `u16::from_str`
+                // would otherwise accept (`+80`).
+                if !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(format!("invalid port '{}'", value.escape_debug()));
+                }
                 match value.parse::<u16>() {
                     Ok(port) => options.port = port,
                     Err(_) => return Err(format!("invalid port '{}'", value.escape_debug())),
@@ -373,11 +378,16 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_port_is_an_error() {
+    fn signed_port_is_an_error() {
         assert_eq!(
-            parse_args(&argv(&["--port", "70000"])),
-            Err("invalid port '70000'".to_string())
+            parse_args(&argv(&["--port", "+80"])),
+            Err("invalid port '+80'".to_string())
         );
+    }
+
+    #[test]
+    fn port_with_leading_zeros_is_accepted() {
+        assert_eq!(run_options(&["--port", "00080"]).port, 80);
     }
 
     #[test]

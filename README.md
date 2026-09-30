@@ -89,8 +89,10 @@ Requests that exceed the parser's limits are rejected with a short plain-text bo
 | Malformed request line, method or request target              | `400 Bad Request`                   |
 | Asterisk-form target (`*`) on a method other than `OPTIONS`    | `400 Bad Request`                   |
 | HTTP/1.1 request without exactly one valid `Host` header      | `400 Bad Request`                   |
-| `Content-Length` that is not a plain decimal number, or two conflicting values (even when one of them overflows) | `400 Bad Request` |
+| `Host` field value that is not a valid `uri-host [":" port ]` (RFC 9110 7.2) | `400 Bad Request`                   |
+| `Content-Length` that is not a plain decimal number, or two conflicting values (even when one of them overflows) | `400 Bad Request`                   |
 | Malformed header line: no colon, whitespace before the colon, a non-token field name, an obsolete folded continuation line, or a control character in the value | `400 Bad Request` |
+| `Accept-Encoding` that refuses the `identity` coding (RFC 9110 12.5.3) | `406 Not Acceptable`                |
 | `Expect` header with a value other than `100-continue`        | `417 Expectation Failed`            |
 | Request head and body not complete within 10 s                  | `408 Request Timeout`               |
 
@@ -107,7 +109,9 @@ for HTTP/1.0 as well as HTTP/1.1. Multiple `Accept-Language` field lines are com
 been sent as one comma-separated list (RFC 9110 5.3). Each `q` weight must match the RFC 9110 `qvalue` grammar
 `qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] )`, so `0`, `0.5`, `0.125`, `1` and `1.000` are
 accepted while `.5`, `00.5`, `+0.5`, `1e-1`, `0.0001`, `0.1234` and `1.5` are not; a malformed weight drops that
-entry. The `Host` value is not validated as an authority, since it is not used for routing.
+entry, and so does a tag that is not a `language-range` (RFC 4647 2.1). A `Host` field value must be a
+`uri-host [":" port ]` (RFC 9110 7.2), so `user@host` (userinfo), `[::1` (an unterminated IP-literal) and `%zz`
+(a bad percent-escape) are rejected with `400 Bad Request`.
 
 ### Access log
 
@@ -158,19 +162,22 @@ carries no body, and its `Content-Length` still matches the body the correspondi
 
 ## Response headers
 
-Every response carries `Date` (IMF-fixdate, GMT), `Server: helloworld/<version>`,
-`Content-Type: text/plain; charset=utf-8`, `Content-Length`, and `Connection: close`.
+Every final response carries `Date` (IMF-fixdate, GMT), `Server: helloworld/<version>`,
+`Content-Type: text/plain; charset=utf-8`, `Content-Length`, `Connection: close` and `Vary: Accept-Encoding`. The
+`100 Continue` preliminary response is the exception: it carries only its status line.
 
-Responses to `/` may carry two additional headers:
+Responses to `/` may carry one additional header:
 
 - `Content-Language: <code>` — sent when the greeting came from the catalog, i.e. whenever `--text` was
   not given.
-- `Vary: Accept-Language` — sent whenever the greeting is negotiated from the request's
-  `Accept-Language` header, which is every catalog response: the greeting depends on that header even when it
-  is absent. `--lang` and `--text` suppress it.
 
-`/healthz` and every other response carry no extra headers; the `405` carries `Allow: GET, HEAD` and the
-`503` rejection carries `Retry-After: 1`. Every response is written as `HTTP/1.1`, even to an HTTP/1.0 request.
+The `/` catalog responses — the greeting and the language `406` — extend `Vary` to
+`Accept-Language, Accept-Encoding`, because the body depends on the request's `Accept-Language` header even when
+it is absent. `--lang` and `--text` responses vary on `Accept-Encoding` only.
+
+`/healthz` and every other response carry no other extra headers; the `405` carries `Allow: GET, HEAD` and the
+`503` rejection carries `Retry-After: 1` and `Vary: Accept-Encoding`. Every response is written as `HTTP/1.1`, even
+to an HTTP/1.0 request.
 
 ## Greeting resolution precedence
 
@@ -183,6 +190,10 @@ For every request to `/`, the greeting is resolved in this order:
    no catalog language acceptable is answered `406 Not Acceptable`; an absent, empty or malformed header
    keeps the `en` default.
 4. `en` — the default.
+
+Independently of the language, a request that refuses the `identity` content coding — `Accept-Encoding: identity;q=0`,
+or `*;q=0` with no `identity` entry — is answered `406 Not Acceptable` on every route, since the response carries
+no content coding (RFC 9110 12.5.3).
 
 A plain `curl http://127.0.0.1:21212/` with no language arguments or headers therefore still returns
 `200 OK` with the English greeting.

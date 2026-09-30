@@ -152,10 +152,17 @@ pub fn lookup(code: &str) -> Option<&'static Lang> {
 }
 
 /// Greeting for a code, falling back to the default language.
+///
+/// `code` is looked up first; if it is not in the catalog the greeting of
+/// [`DEFAULT_CODE`] is returned. When neither is in the catalog the result is
+/// an empty string.
 pub fn greeting_for(code: &str) -> &'static str {
-    match lookup(code) {
+    if let Some(lang) = lookup(code) {
+        return lang.greeting;
+    }
+    match lookup(DEFAULT_CODE) {
         Some(lang) => lang.greeting,
-        None => greeting_for(DEFAULT_CODE),
+        None => "",
     }
 }
 
@@ -204,14 +211,35 @@ fn parse_qvalue(value: &str) -> Option<f32> {
     format!("{integer}.{fraction}").parse::<f32>().ok()
 }
 
-/// Parse an `Accept-Language` header into `(quality, tag)` pairs.
+/// Whether `tag` is a `language-range` (RFC 4647 2.1).
+///
+/// A range is `*` or 1..=8 ASCII letters followed by any number of
+/// `-`-separated 1..=8 character ASCII alphanumeric subtags.
+fn language_range_is_valid(tag: &str) -> bool {
+    if tag == "*" {
+        return true;
+    }
+    let mut subtags = tag.split('-');
+    let primary = subtags.next().unwrap_or("");
+    if primary.is_empty() || primary.len() > 8 || !primary.bytes().all(|b| b.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    subtags.all(|subtag| {
+        !subtag.is_empty() && subtag.len() <= 8 && subtag.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+/// Parse a weighted list into `(quality, tag)` pairs.
 ///
 /// Entries are split on `,`; the tag is everything before the first `;`. The
 /// weight defaults to `1.0` and is set by a `q=value` parameter (matched
-/// case-insensitively) whose value is validated by [`parse_qvalue`]; a malformed or
+/// case-insensitively) whose value is validated by `parse_qvalue`; a malformed or
 /// missing weight drops the whole entry. Later `q` parameters override earlier
-/// ones, and other parameters are ignored.
-fn parse_entries(header: &str) -> Vec<(f32, &str)> {
+/// ones, and other parameters are ignored. The tag itself is not validated, so the
+/// `Accept-Language` range list and the `Accept-Encoding` coding list are parsed
+/// by this one function.
+pub fn parse_weighted_list(header: &str) -> Vec<(f32, &str)> {
     let mut entries: Vec<(f32, &str)> = Vec::new();
     for raw in header.split(',') {
         let raw = raw.trim();
@@ -240,6 +268,17 @@ fn parse_entries(header: &str) -> Vec<(f32, &str)> {
         }
     }
     entries
+}
+
+/// Parse an `Accept-Language` header into `(quality, tag)` pairs.
+///
+/// Entries are parsed by [`parse_weighted_list`]; an entry whose tag is not a
+/// `language-range` per [`language_range_is_valid`] is dropped as well.
+fn parse_entries(header: &str) -> Vec<(f32, &str)> {
+    parse_weighted_list(header)
+        .into_iter()
+        .filter(|(_, tag)| language_range_is_valid(tag))
+        .collect()
 }
 
 /// Weight of `code` under `entries`, using the most specific matching range.
@@ -276,8 +315,9 @@ pub enum Negotiated {
 /// Parse an `Accept-Language` header and decide which catalog language to serve.
 ///
 /// Every entry's weight is parsed (default `1.0`); an entry whose weight is
-/// missing or malformed is ignored, and a valid weight of `0` makes that language
-/// not acceptable (RFC 9110 12.4.2). The most specific matching range decides,
+/// missing or malformed, or whose tag is not a `language-range` (RFC 4647 2.1),
+/// is ignored, and a valid weight of `0` makes that language not acceptable
+/// (RFC 9110 12.4.2). The most specific matching range decides,
 /// so an exact range beats `*`. The highest weight wins, with ties resolved in
 /// catalog order, and a header with no usable entry leaves the default acceptable.
 pub fn negotiate(header: &str) -> Negotiated {
@@ -410,6 +450,32 @@ mod tests {
             assert_eq!(negotiate(header), lang(DEFAULT_CODE), "header {header:?}");
         }
         assert_eq!(negotiate("nl;q=1.000"), lang("nl"));
+    }
+
+    #[test]
+    fn parse_entries_drops_ill_formed_ranges() {
+        for header in [
+            "-;q=1",
+            "123;q=1",
+            "!;q=1",
+            "abcdefghi;q=1",
+            "en-;q=1",
+            "en-abcdefghi;q=1",
+            "en_US;q=1",
+        ] {
+            assert!(parse_entries(header).is_empty(), "should drop {header:?}");
+        }
+    }
+
+    #[test]
+    fn negotiate_treats_an_ill_formed_range_as_malformed() {
+        assert_eq!(negotiate("-;q=1"), lang("en"));
+        assert_eq!(negotiate("123;q=1"), lang("en"));
+        assert_eq!(negotiate("abcdefghi;q=1"), lang("en"));
+        assert_eq!(negotiate("-;q=1, de;q=0.5"), lang("de"));
+        assert_eq!(negotiate("en-US;q=0.9"), lang("en"));
+        assert_eq!(negotiate("en-abcdefgh;q=0.9"), lang("en"));
+        assert_eq!(negotiate("xx;q=1"), Negotiated::NotAcceptable);
     }
 
     #[test]
