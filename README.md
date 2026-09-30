@@ -83,14 +83,15 @@ Requests that exceed the parser's limits are rejected with a short plain-text bo
 | Request line longer than 8 KiB                               | `414 URI Too Long`                  |
 | Single header line longer than 8 KiB, headers larger than 64 KiB in total, or more than 100 fields | `431 Request Header Fields Too Large` |
 | Request body larger than 8 MiB, or a `Content-Length` above 8 MiB (checked before the body is read) | `413 Payload Too Large` |
-| Any request carrying a `Transfer-Encoding` header               | `501 Not Implemented`               |
+| A request whose final transfer coding is `chunked` (this server decodes no transfer coding) | `501 Not Implemented` |
+| A request whose final transfer coding is not `chunked`, or an HTTP/1.0 request carrying any `Transfer-Encoding` | `400 Bad Request` |
 | Version token that is not `HTTP/...`                          | `400 Bad Request`                   |
 | `HTTP` major version other than 1, or an `HTTP/1.x` minor that is empty or not numeric | `505 HTTP Version Not Supported` |
 | Malformed request line, method or request target              | `400 Bad Request`                   |
 | Asterisk-form target (`*`) on a method other than `OPTIONS`    | `400 Bad Request`                   |
 | HTTP/1.1 request without exactly one valid `Host` header      | `400 Bad Request`                   |
 | `Host` field value that is not a valid `uri-host [":" port ]` (RFC 9110 7.2) | `400 Bad Request`                   |
-| `Content-Length` that is not a plain decimal number, or two conflicting values (even when one of them overflows) | `400 Bad Request`                   |
+| `Content-Length` that is not a comma-separated list of valid decimal numerals with the same value (even when one of them overflows) | `400 Bad Request`                   |
 | Malformed header line: no colon, whitespace before the colon, a non-token field name, an obsolete folded continuation line, or a control character in the value | `400 Bad Request` |
 | `Accept-Encoding` that refuses the `identity` coding (RFC 9110 12.5.3) | `406 Not Acceptable`                |
 | `Expect` header with a value other than `100-continue`        | `417 Expectation Failed`            |
@@ -103,10 +104,18 @@ the path.
 
 A higher `HTTP/1.x` minor version such as `HTTP/1.2` is processed as HTTP/1.1 (RFC 7230 2.6).
 
+The request body length comes from the final transfer coding when a `Transfer-Encoding` is present
+(RFC 9112 6.3); this server decodes no transfer coding, so a final `chunked` coding is answered
+`501 Not Implemented` and any other final coding is answered `400 Bad Request`. An HTTP/1.0 request
+carrying a `Transfer-Encoding` is answered `400 Bad Request` because its framing is faulty
+(RFC 9112 6.1). Without a `Transfer-Encoding`, a `Content-Length` whose comma-separated values are
+all the same decimal value frames the body (RFC 9112 6.3 rule 5).
+
 The parser is lenient in a few places: a bare LF is accepted as a line terminator, EOF inside the header
 block ends the head (the request is served as if the blank line had arrived), and a duplicate `Host` is rejected
 for HTTP/1.0 as well as HTTP/1.1. Multiple `Accept-Language` field lines are combined in order, as if they had
-been sent as one comma-separated list (RFC 9110 5.3). Each `q` weight must match the RFC 9110 `qvalue` grammar
+been sent as one comma-separated list (RFC 9110 5.3), as are multiple `Content-Length` field lines.
+Each `q` weight must match the RFC 9110 `qvalue` grammar
 `qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] )`, so `0`, `0.5`, `0.125`, `1` and `1.000` are
 accepted while `.5`, `00.5`, `+0.5`, `1e-1`, `0.0001`, `0.1234` and `1.5` are not; a malformed weight drops that
 entry, and so does a tag that is not a `language-range` (RFC 4647 2.1). A `Host` field value must be a
@@ -151,7 +160,8 @@ served and its response is unaffected.
 | `GET /`, `HEAD /`              | `200 OK`, the greeting + newline, or `406 Not Acceptable`                 |
 | `GET /healthz`, `HEAD /healthz` | `200 OK`, body `ok` and a newline                                        |
 | any other path                 | `404 Not Found`, short plain-text body                                    |
-| any other method               | `405 Method Not Allowed`, `Allow: GET, HEAD`, short plain-text body         |
+| any other recognized method     | `405 Method Not Allowed`, `Allow: GET, HEAD`, short plain-text body         |
+| a method the server does not recognize | `501 Not Implemented`, short plain-text body                          |
 
 `GET /` is answered with `406 Not Acceptable` when the request's `Accept-Language` header leaves no
 catalog language acceptable (see [Greeting resolution precedence](#greeting-resolution-precedence)).

@@ -485,6 +485,49 @@ fn post_is_405_with_allow_header() {
 }
 
 #[test]
+fn unrecognized_method_is_501() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "FOO / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 501 Not Implemented");
+    assert_eq!(header(&response, "Allow"), None);
+    assert_eq!(body(&response), "not implemented\n");
+}
+
+#[test]
+fn comma_separated_content_length_is_served() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5, 5\r\nConnection: close\r\n\r\nhello",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(body(&response), "Hello, World!\n");
+}
+
+#[test]
+fn conflicting_comma_separated_content_length_is_400() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5, 6\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
+fn transfer_encoding_without_final_chunked_is_400() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
 fn http11_without_host_is_400() {
     let server = Server::start(&[]);
     let response = request(server.port, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");

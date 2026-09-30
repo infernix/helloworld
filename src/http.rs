@@ -73,6 +73,15 @@ const VARY_ENCODING: &str = "Accept-Encoding";
 /// `Vary` value for `/` catalog responses, which negotiate `Accept-Language`.
 const VARY_LANGUAGE: &str = "Accept-Language, Accept-Encoding";
 
+/// Methods the server recognizes (RFC 9110 9.1, 15.5.6, 15.6.2; RFC 5789 2).
+///
+/// A recognized method the target does not support is answered with `405 Method
+/// Not Allowed`; an unrecognized method token is answered with `501 Not
+/// Implemented`.
+const KNOWN_METHODS: [&str; 9] = [
+    "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
+];
+
 /// Weekday names for IMF-fixdate formatting, indexed by day of week.
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -486,6 +495,94 @@ fn timeout_or(err: io::Error, head_only: bool) -> Result<Option<RequestInfo>, Fa
     }
 }
 
+/// The framing error a request's `Transfer-Encoding` field(s) carry, if any.
+///
+/// A message with a `Transfer-Encoding` is framed by its final transfer coding
+/// (RFC 9112 6.3 rule 4), and this server decodes none (RFC 9112 6.1): a final
+/// `chunked` coding is answered with `501 Not Implemented`, while any other
+/// final coding — or no coding at all — leaves the body length undeterminable and
+/// is answered with `400 Bad Request`. An HTTP/1.0 message with a
+/// `Transfer-Encoding` has faulty framing whatever the coding (RFC 9112 6.1), so it
+/// is answered with `400 Bad Request` as well. Returns the status and body of the
+/// error, or `None` when the field is absent.
+fn transfer_encoding_failure(
+    version: Version,
+    headers: &[(String, String)],
+) -> Option<(&'static str, &'static str)> {
+    let mut present = false;
+    let mut final_coding: Option<&str> = None;
+    for (_, value) in headers
+        .iter()
+        .filter(|(name, _)| name == "transfer-encoding")
+    {
+        present = true;
+        for element in value.split(',') {
+            let coding = element.split(';').next().unwrap_or("").trim();
+            if !coding.is_empty() {
+                final_coding = Some(coding);
+            }
+        }
+    }
+    if !present {
+        return None;
+    }
+    if version == Version::Http11
+        && final_coding.is_some_and(|coding| coding.eq_ignore_ascii_case("chunked"))
+    {
+        return Some(("501 Not Implemented", "not implemented\n"));
+    }
+    Some(("400 Bad Request", "bad request\n"))
+}
+
+/// Frame the request body from its `Content-Length` field(s).
+///
+/// Without a `Transfer-Encoding`, the body length is the field's decimal value
+/// (RFC 9112 6.3 rule 6), and a message with an invalid `Content-Length` is an
+/// unrecoverable framing error (rule 5) unless the combined field value parses as
+/// a comma-separated list whose elements are all valid decimal numerals with the
+/// same value, in which case that value frames the body. Empty list elements are
+/// ignored (RFC 9110 5.6.1). Returns the number of octets to drain, or the
+/// status and body of the error.
+fn content_length(headers: &[(String, String)]) -> Result<u64, (&'static str, &'static str)> {
+    let mut present = false;
+    let mut raw: Option<&str> = None;
+    let mut parsed: Option<u64> = None;
+    for (_, value) in headers.iter().filter(|(name, _)| name == "content-length") {
+        present = true;
+        for element in value.split(',') {
+            let element = element.trim();
+            if element.is_empty() {
+                continue;
+            }
+            if !element.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(("400 Bad Request", "bad request\n"));
+            }
+            let number = element.parse::<u64>().ok();
+            if let Some(previous) = raw {
+                // The values must be the same decimal value, so a leading
+                // zero does not make a value differ.
+                let same = previous == element || (parsed.is_some() && parsed == number);
+                if !same {
+                    return Err(("400 Bad Request", "bad request\n"));
+                }
+            } else {
+                raw = Some(element);
+                parsed = number;
+            }
+        }
+    }
+    if !present {
+        return Ok(0);
+    }
+    if raw.is_none() {
+        return Err(("400 Bad Request", "bad request\n"));
+    }
+    match parsed {
+        Some(value) => Ok(value),
+        None => Err(("413 Payload Too Large", "payload too large\n")),
+    }
+}
+
 /// Parse one request and write the response.
 ///
 /// Returns `None` when the peer closed the connection before sending a request
@@ -699,67 +796,37 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
         );
     }
 
-    // A body is drained, never buffered, so a chunked request is unsupported.
-    if header(&headers, "transfer-encoding").is_some() {
+    // The body is framed by the transfer coding when one is present; this
+    // server decodes none, so the framing decides the error (RFC 9112 6.1,
+    // 6.3 rule 4).
+    if let Some((status, body)) = transfer_encoding_failure(version, &headers) {
         return fail(
             writer,
             method,
             &path,
-            "501 Not Implemented",
-            "not implemented\n",
+            status,
+            body,
             VARY_ENCODING,
             head_only,
         );
     }
 
-    let mut raw_length: Option<&str> = None;
-    for (_, value) in headers.iter().filter(|(name, _)| name == "content-length") {
-        // A valid Content-Length is `1*DIGIT`; anything else is malformed.
-        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+    // Without Transfer-Encoding, Content-Length frames the body; an invalid
+    // field is an unrecoverable framing error unless it is a comma-separated
+    // list of the same value (RFC 9112 6.3 rule 5).
+    let content_length = match content_length(&headers) {
+        Ok(length) => length,
+        Err((status, body)) => {
             return fail(
                 writer,
                 method,
                 &path,
-                "400 Bad Request",
-                "bad request\n",
+                status,
+                body,
                 VARY_ENCODING,
                 head_only,
             );
         }
-        // RFC 7230 3.3.2: conflicting field-values are an unrecoverable
-        // framing error, whatever their magnitude, so compare the raw values.
-        if let Some(previous) = raw_length {
-            if previous != value {
-                return fail(
-                    writer,
-                    method,
-                    &path,
-                    "400 Bad Request",
-                    "bad request\n",
-                    VARY_ENCODING,
-                    head_only,
-                );
-            }
-        }
-        raw_length = Some(value);
-    }
-    let content_length = match raw_length {
-        // Digits-only, so only an overflowing magnitude can fail to parse.
-        Some(value) => match value.parse::<u64>() {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                return fail(
-                    writer,
-                    method,
-                    &path,
-                    "413 Payload Too Large",
-                    "payload too large\n",
-                    VARY_ENCODING,
-                    head_only,
-                );
-            }
-        },
-        None => 0,
     };
     if content_length > MAX_BODY as u64 {
         return fail(
@@ -863,11 +930,21 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                 VARY_ENCODING,
             ),
         },
-        _ => (
+        // A recognized method the target does not support is answered 405
+        // with its supported methods (RFC 9110 15.5.6); an unrecognized
+        // method token is answered 501 (RFC 9110 15.6.2).
+        _ if KNOWN_METHODS.contains(&method) => (
             "405 Method Not Allowed",
             "-".to_string(),
             "method not allowed\n".to_string(),
             vec![("Allow", "GET, HEAD")],
+            VARY_ENCODING,
+        ),
+        _ => (
+            "501 Not Implemented",
+            "-".to_string(),
+            "not implemented\n".to_string(),
+            Vec::new(),
             VARY_ENCODING,
         ),
     };
@@ -1552,6 +1629,29 @@ mod tests {
     }
 
     #[test]
+    fn recognized_method_without_a_handler_is_not_allowed() {
+        let (response, info) = run(
+            "PATCH / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        let info = info.expect("served");
+        assert_eq!(info.status, "405 Method Not Allowed");
+        assert_eq!(header_value(&response, "Allow"), Some("GET, HEAD"));
+    }
+
+    #[test]
+    fn unrecognized_method_is_not_implemented() {
+        let (response, info) = run(
+            "FOO / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        let info = info.expect("served");
+        assert_eq!(info.status, "501 Not Implemented");
+        assert_eq!(body(&response), "not implemented\n");
+        assert_eq!(header_value(&response, "Allow"), None);
+    }
+
+    #[test]
     fn body_is_drained() {
         let mut reader = BufReader::new(Cursor::new(
             b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
@@ -1588,6 +1688,43 @@ mod tests {
     fn conflicting_content_lengths_are_bad_request() {
         let (_, info) = run(
             "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn comma_separated_content_length_list_is_accepted() {
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5, 5\r\n\r\nhello",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "200 OK");
+        assert_eq!(body(&response), "Hello, World!\n");
+    }
+
+    #[test]
+    fn comma_separated_content_length_list_with_leading_zero_is_accepted() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5, 05\r\n\r\nhello",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "200 OK");
+    }
+
+    #[test]
+    fn conflicting_comma_separated_content_lengths_are_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5, 6\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn empty_comma_separated_content_length_list_is_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: ,\r\n\r\n",
             &default_config(),
         );
         assert_eq!(info.expect("served").status, "400 Bad Request");
@@ -1637,6 +1774,43 @@ mod tests {
         );
         assert_eq!(info.expect("served").status, "501 Not Implemented");
         assert_eq!(body(&response), "not implemented\n");
+    }
+
+    #[test]
+    fn transfer_encoding_without_final_chunked_is_bad_request() {
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+        assert_eq!(body(&response), "bad request\n");
+    }
+
+    #[test]
+    fn transfer_encoding_after_chunked_is_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn transfer_encoding_without_a_coding_is_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: \r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn http10_transfer_encoding_is_bad_request() {
+        let (_, info) = run(
+            "GET / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
     }
 
     #[test]
