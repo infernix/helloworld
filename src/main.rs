@@ -1,17 +1,52 @@
 //! `helloworld` — a multilingual hello-world HTTP server with zero dependencies.
 
+#![forbid(unsafe_code)]
+
 mod http;
 mod i18n;
 
 use std::env;
-use std::io::Write;
-use std::net::TcpListener;
+use std::io::{self, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::process;
 use std::sync::Arc;
 
 /// Default TCP port when `--port` is not given.
 const DEFAULT_PORT: u16 = 21212;
 
+/// Default bind address when `--host` is not given.
+const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+/// Version reported by `--version`, taken from the crate manifest.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Resolved options for a normal server run.
+#[derive(Debug, PartialEq, Eq)]
+struct Options {
+    /// IP address to bind.
+    host: IpAddr,
+    /// TCP port to listen on.
+    port: u16,
+    /// Language code for the greeting, if one was requested.
+    lang: Option<&'static str>,
+    /// Custom greeting text, if one was requested.
+    text: Option<String>,
+}
+
+/// What the command line asked the program to do.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    /// Start the server with these options.
+    Run(Options),
+    /// Print the usage text and exit.
+    Help,
+    /// Print the supported language table and exit.
+    ListLangs,
+    /// Print the version and exit.
+    Version,
+}
+
+/// Build the `--help` text.
 fn usage() -> String {
     format!(
         "\
@@ -23,8 +58,10 @@ Options:
   -l, --lang <CODE>    Language code for the greeting (default: en)
   -t, --text <STRING>  Custom greeting, replaces the greeting entirely
   -p, --port <PORT>    TCP port to listen on (default: {DEFAULT_PORT})
+      --host <IP>      IP address to bind (default: 127.0.0.1)
       --list-langs     List supported language codes and exit
-  -h, --help          Print this help and exit
+  -V, --version        Print version and exit
+  -h, --help           Print this help and exit
 
 Flags accept both `--flag value` and `--flag=value` forms.
 Supported language codes: {codes}
@@ -36,6 +73,7 @@ Endpoints:
 Examples:
   helloworld --lang nl
   helloworld --text 'Bonjour le monde!' --port 21213
+  helloworld --host 0.0.0.0 --port 8080
   curl -s -H 'Accept-Language: de-DE,de;q=0.9' http://127.0.0.1:{DEFAULT_PORT}/
 ",
         DEFAULT_PORT = DEFAULT_PORT,
@@ -43,121 +81,293 @@ Examples:
     )
 }
 
-/// Parsed command line.
-struct Options {
-    lang: Option<&'static str>,
-    text: Option<String>,
-    port: u16,
+/// Write `text` to stdout, ignoring I/O errors so a closed pipe never panics.
+fn print_stdout(text: &str) {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    let _ = handle.write_all(text.as_bytes());
+    let _ = handle.flush();
 }
 
-fn fail(message: &str) -> ! {
-    eprintln!("helloworld: {message}");
-    eprintln!("try 'helloworld --help' for usage");
-    process::exit(2);
-}
-
-/// Fetch the value of `name`, either inline (`--flag=value`) or from the next arg.
-fn flag_value(argv: &[String], index: &mut usize, name: &str, inline: Option<String>) -> String {
+/// Fetch the value of `name`, either inline (`--flag=value`) or from the next argument.
+fn flag_value(
+    argv: &[String],
+    index: &mut usize,
+    name: &str,
+    inline: Option<&str>,
+) -> Result<String, String> {
     if let Some(value) = inline {
         if value.is_empty() {
-            fail(&format!("missing value for {name}"));
+            return Err(format!("missing value for {name}"));
         }
-        return value;
+        return Ok(value.to_string());
     }
     *index += 1;
     match argv.get(*index) {
-        Some(value) => value.clone(),
-        None => fail(&format!("missing value for {name}")),
+        Some(value) if !value.is_empty() => Ok(value.clone()),
+        _ => Err(format!("missing value for {name}")),
     }
 }
 
-fn parse_args(argv: &[String]) -> Options {
+/// Parse `argv` (program name already stripped) into a [`Command`].
+fn parse_args(argv: &[String]) -> Result<Command, String> {
     let mut options = Options {
+        host: DEFAULT_HOST,
+        port: DEFAULT_PORT,
         lang: None,
         text: None,
-        port: DEFAULT_PORT,
     };
     let mut index = 0;
 
     while index < argv.len() {
-        let arg = argv[index].clone();
+        let arg = &argv[index];
         let (name, inline) = match arg.split_once('=') {
-            Some((name, value)) => (name.to_string(), Some(value.to_string())),
-            None => (arg.clone(), None),
+            Some((name, value)) => (name, Some(value)),
+            None => (arg.as_str(), None),
         };
 
-        match name.as_str() {
-            "-h" | "--help" => {
-                print!("{}", usage());
-                let _ = std::io::stdout().flush();
-                process::exit(0);
-            }
-            "--list-langs" => {
-                print!("{}", i18n::list_langs());
-                let _ = std::io::stdout().flush();
-                process::exit(0);
-            }
+        match name {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--list-langs" => return Ok(Command::ListLangs),
+            "-V" | "--version" => return Ok(Command::Version),
             "-l" | "--lang" => {
-                let value = flag_value(argv, &mut index, &name, inline);
+                let value = flag_value(argv, &mut index, name, inline)?;
                 match i18n::lookup(&value) {
                     Some(lang) => options.lang = Some(lang.code),
                     None => {
-                        eprintln!("helloworld: unsupported language code '{value}'");
-                        eprintln!("supported codes: {}", i18n::supported_codes());
-                        process::exit(2);
+                        return Err(format!(
+                            "unsupported language code '{value}'; supported codes: {}",
+                            i18n::supported_codes()
+                        ));
                     }
                 }
             }
             "-t" | "--text" => {
-                options.text = Some(flag_value(argv, &mut index, &name, inline));
+                options.text = Some(flag_value(argv, &mut index, name, inline)?);
             }
             "-p" | "--port" => {
-                let value = flag_value(argv, &mut index, &name, inline);
+                let value = flag_value(argv, &mut index, name, inline)?;
                 match value.parse::<u16>() {
                     Ok(port) if port != 0 => options.port = port,
-                    _ => fail(&format!("invalid port '{value}'")),
+                    _ => return Err(format!("invalid port '{value}'")),
                 }
             }
-            other => fail(&format!("unknown argument '{other}'")),
+            "--host" => {
+                let value = flag_value(argv, &mut index, name, inline)?;
+                match value.parse::<IpAddr>() {
+                    Ok(host) => options.host = host,
+                    Err(_) => {
+                        return Err(format!("invalid host '{value}' (expected an IP address)"));
+                    }
+                }
+            }
+            other => return Err(format!("unknown argument '{other}'")),
         }
 
         index += 1;
     }
 
-    options
+    Ok(Command::Run(options))
 }
 
+/// Entry point: parse the command line, then run, print or fail.
 fn main() {
     let argv: Vec<String> = env::args().skip(1).collect();
-    let options = parse_args(&argv);
 
-    let listener = match TcpListener::bind(("127.0.0.1", options.port)) {
-        Ok(listener) => listener,
-        Err(err) => {
-            eprintln!(
-                "helloworld: failed to bind 127.0.0.1:{}: {err}",
-                options.port
-            );
-            process::exit(1);
+    let command = match parse_args(&argv) {
+        Ok(command) => command,
+        Err(message) => {
+            eprintln!("helloworld: {message}");
+            eprintln!("try 'helloworld --help' for usage");
+            process::exit(2);
         }
     };
 
-    let addr = match listener.local_addr() {
-        Ok(addr) => addr.to_string(),
-        Err(_) => format!("127.0.0.1:{}", options.port),
+    let options = match command {
+        Command::Help => {
+            print_stdout(&usage());
+            return;
+        }
+        Command::ListLangs => {
+            print_stdout(&i18n::list_langs());
+            return;
+        }
+        Command::Version => {
+            print_stdout(&format!("helloworld {VERSION}\n"));
+            return;
+        }
+        Command::Run(options) => options,
+    };
+
+    let addr = SocketAddr::new(options.host, options.port);
+    let listener = match TcpListener::bind(addr) {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("helloworld: failed to bind {addr}: {err}");
+            process::exit(1);
+        }
     };
 
     let active = match &options.text {
         Some(_) => "custom (--text)".to_string(),
         None => options.lang.unwrap_or(i18n::DEFAULT_CODE).to_string(),
     };
-
-    println!("helloworld listening on http://{addr} (language: {active})");
-    let _ = std::io::stdout().flush();
+    print_stdout(&format!(
+        "helloworld listening on http://{addr} (language: {active})\n"
+    ));
 
     let config = Arc::new(http::Config {
         lang: options.lang,
         text: options.text,
     });
     http::serve(listener, config);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an argv vector from string literals.
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    /// Options with every field left at its default.
+    fn defaults() -> Options {
+        Options {
+            host: DEFAULT_HOST,
+            port: DEFAULT_PORT,
+            lang: None,
+            text: None,
+        }
+    }
+
+    /// Run `parse_args` and unwrap the [`Command::Run`] options.
+    fn run_options(args: &[&str]) -> Options {
+        match parse_args(&argv(args)) {
+            Ok(Command::Run(options)) => options,
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_argv_yields_defaults() {
+        assert_eq!(parse_args(&argv(&[])), Ok(Command::Run(defaults())));
+    }
+
+    #[test]
+    fn defaults_are_localhost_and_21212() {
+        let options = run_options(&[]);
+        assert_eq!(options.host, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(options.port, 21212);
+        assert_eq!(options.lang, None);
+        assert_eq!(options.text, None);
+    }
+
+    #[test]
+    fn lang_flag_sets_language() {
+        assert_eq!(run_options(&["--lang", "nl"]).lang, Some("nl"));
+    }
+
+    #[test]
+    fn inline_short_lang_flag_is_case_insensitive() {
+        assert_eq!(run_options(&["-l=NL"]).lang, Some("nl"));
+    }
+
+    #[test]
+    fn last_lang_flag_wins() {
+        assert_eq!(run_options(&["--lang", "nl", "-l", "de"]).lang, Some("de"));
+    }
+
+    #[test]
+    fn unsupported_language_is_an_error() {
+        let err = parse_args(&argv(&["--lang", "klingon"])).unwrap_err();
+        assert!(
+            err.starts_with("unsupported language code 'klingon'; supported codes: "),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn port_flag_sets_port() {
+        assert_eq!(run_options(&["--port", "8080"]).port, 8080);
+    }
+
+    #[test]
+    fn zero_port_is_an_error() {
+        assert_eq!(
+            parse_args(&argv(&["--port", "0"])),
+            Err("invalid port '0'".to_string())
+        );
+    }
+
+    #[test]
+    fn out_of_range_port_is_an_error() {
+        assert_eq!(
+            parse_args(&argv(&["--port", "70000"])),
+            Err("invalid port '70000'".to_string())
+        );
+    }
+
+    #[test]
+    fn host_flag_sets_address() {
+        assert_eq!(
+            run_options(&["--host", "0.0.0.0"]).host,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+    }
+
+    #[test]
+    fn hostname_is_an_error() {
+        assert_eq!(
+            parse_args(&argv(&["--host", "localhost"])),
+            Err("invalid host 'localhost' (expected an IP address)".to_string())
+        );
+    }
+
+    #[test]
+    fn action_flags_return_their_command() {
+        assert_eq!(parse_args(&argv(&["--help"])), Ok(Command::Help));
+        assert_eq!(parse_args(&argv(&["-h"])), Ok(Command::Help));
+        assert_eq!(parse_args(&argv(&["--list-langs"])), Ok(Command::ListLangs));
+        assert_eq!(parse_args(&argv(&["--version"])), Ok(Command::Version));
+        assert_eq!(parse_args(&argv(&["-V"])), Ok(Command::Version));
+    }
+
+    #[test]
+    fn first_action_flag_wins() {
+        assert_eq!(
+            parse_args(&argv(&["--version", "--help"])),
+            Ok(Command::Version)
+        );
+    }
+
+    #[test]
+    fn trailing_text_flag_is_an_error() {
+        assert_eq!(
+            parse_args(&argv(&["--text"])),
+            Err("missing value for --text".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_inline_text_is_an_error() {
+        assert_eq!(
+            parse_args(&argv(&["--text="])),
+            Err("missing value for --text".to_string())
+        );
+    }
+
+    #[test]
+    fn text_flag_sets_custom_greeting() {
+        assert_eq!(run_options(&["--text", "Hi"]).text, Some("Hi".to_string()));
+    }
+
+    #[test]
+    fn unknown_argument_is_an_error() {
+        assert_eq!(
+            parse_args(&argv(&["--nope"])),
+            Err("unknown argument '--nope'".to_string())
+        );
+    }
 }

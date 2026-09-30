@@ -181,10 +181,15 @@ pub fn supported_codes() -> String {
 /// Parse an `Accept-Language` header and return the best supported code.
 ///
 /// Entries are ordered by descending `q` value (stable, so equal-quality
-/// entries keep their header order) and the first supported one wins.
+/// entries keep their header order) and the first matching one wins. The `q`
+/// parameter name is matched case-insensitively and its value is parsed after
+/// trimming surrounding whitespace; a value that is missing, malformed, not a
+/// finite number or outside `0.0..=1.0` yields a quality of `0.0`, disabling
+/// the entry. An entry whose tag is exactly `*` matches any language and
+/// resolves to [`DEFAULT_CODE`], but only if it wins on quality.
 pub fn negotiate(header: &str) -> Option<&'static str> {
-    let mut entries: Vec<(f32, usize, &str)> = Vec::new();
-    for (index, raw) in header.split(',').enumerate() {
+    let mut entries: Vec<(f32, &str)> = Vec::new();
+    for raw in header.split(',') {
         let raw = raw.trim();
         if raw.is_empty() {
             continue;
@@ -193,22 +198,27 @@ pub fn negotiate(header: &str) -> Option<&'static str> {
         let tag = parts.next().unwrap_or("").trim();
         let mut quality = 1.0_f32;
         for param in parts {
-            let param = param.trim();
-            if let Some(value) = param
-                .strip_prefix("q=")
-                .or_else(|| param.strip_prefix("Q="))
-            {
-                quality = value.trim().parse::<f32>().unwrap_or(0.0);
+            let Some((name, value)) = param.split_once('=') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("q") {
+                quality = match value.trim().parse::<f32>() {
+                    Ok(parsed) if (0.0..=1.0).contains(&parsed) => parsed,
+                    _ => 0.0,
+                };
             }
         }
-        entries.push((quality, index, tag));
+        entries.push((quality, tag));
     }
 
     entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    for (quality, _, tag) in entries {
+    for (quality, tag) in entries {
         if quality <= 0.0 {
             continue;
+        }
+        if tag == "*" {
+            return Some(DEFAULT_CODE);
         }
         if let Some(lang) = lookup(tag) {
             return Some(lang.code);
@@ -254,11 +264,29 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_skips_zero_quality_and_wildcards() {
+    fn negotiate_skips_zero_quality_and_honours_wildcards() {
         assert_eq!(negotiate("nl;q=0,de;q=0.5"), Some("de"));
         assert_eq!(negotiate("nl;q=0"), None);
-        assert_eq!(negotiate("*"), None);
+        assert_eq!(negotiate("*"), Some(DEFAULT_CODE));
         assert_eq!(negotiate("nl;q=bogus"), None);
+    }
+
+    #[test]
+    fn negotiate_orders_wildcard_by_quality() {
+        assert_eq!(negotiate("de;q=0.5, *;q=0.9"), Some("en"));
+        assert_eq!(negotiate("*;q=0.1, de;q=0.9"), Some("de"));
+    }
+
+    #[test]
+    fn negotiate_rejects_out_of_range_or_unparsable_quality() {
+        assert_eq!(negotiate("nl;q=NaN"), None);
+        assert_eq!(negotiate("nl;q=1.5"), None);
+    }
+
+    #[test]
+    fn negotiate_tolerates_whitespace_and_case_in_parameters() {
+        assert_eq!(negotiate("nl;q = 0.5"), Some("nl"));
+        assert_eq!(negotiate("de;Q=0.9"), Some("de"));
     }
 
     #[test]
