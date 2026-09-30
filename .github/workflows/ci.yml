@@ -10,6 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  MSRV: "1.74"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,7 +30,7 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --all-targets --locked
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
-      - run: cargo build --release --locked
+      - run: cargo test --release --all-targets --locked
 
   msrv:
     runs-on: ubuntu-latest
@@ -38,13 +39,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: "1.74.0"
+          toolchain: ${{ env.MSRV }}
       # Keep this toolchain and Cargo.toml's rust-version in step.
       - name: Check the MSRV against rust-version
         run: |
           manifest=$(cargo metadata --format-version 1 --no-deps --offline | sed -n 's/.*"rust_version":"\([^"]*\)".*/\1/p')
-          if [ "$manifest" != "1.74" ]; then
-            echo "MSRV job uses 1.74.0 but Cargo.toml declares rust-version $manifest" >&2
+          if [ "$manifest" != "$MSRV" ]; then
+            echo "MSRV job uses $MSRV but Cargo.toml declares rust-version $manifest" >&2
             exit 1
           fi
       - run: cargo test --all-targets --locked

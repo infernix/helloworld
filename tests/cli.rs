@@ -168,6 +168,31 @@ fn help_flag_prints_usage_and_exits_zero() {
         stdout.contains("Usage: helloworld"),
         "usage text missing from {stdout:?}"
     );
+    for expected in [
+        "-l, --lang",
+        "-t, --text",
+        "-p, --port",
+        "--host",
+        "--list-langs",
+        "-V, --version",
+        "-h, --help",
+        "default: 21212",
+        "max 8192 bytes",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "usage missing {expected:?}: {stdout:?}"
+        );
+    }
+    for code in [
+        "ar", "cs", "da", "de", "el", "en", "es", "fi", "fr", "he", "it", "ja", "ko", "nb", "nl",
+        "pl", "pt", "ru", "sv", "tr", "uk", "zh",
+    ] {
+        assert!(
+            stdout.contains(code),
+            "usage missing language code {code:?}: {stdout:?}"
+        );
+    }
 }
 
 #[test]
@@ -176,6 +201,18 @@ fn list_langs_prints_the_catalog() {
     assert_eq!(code, 0);
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines.len(), 22, "expected 22 locales, got {stdout:?}");
+    let codes: Vec<&str> = lines
+        .iter()
+        .map(|line| line.split_once('\t').expect("tab-separated row").0)
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "en", "nl", "de", "fr", "es", "it", "pt", "pl", "sv", "da", "fi", "nb", "ru", "uk",
+            "ja", "zh", "ko", "ar", "he", "tr", "el", "cs"
+        ],
+        "unexpected catalog order: {stdout:?}"
+    );
     for line in lines {
         let (code, name) = line.split_once('\t').expect("tab-separated row");
         assert!(
@@ -234,6 +271,19 @@ fn accept_language_is_negotiated() {
 }
 
 #[test]
+fn unacceptable_accept_language_is_406() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: en;q=0\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 406 Not Acceptable");
+    assert_eq!(body(&response), "not acceptable\n");
+    assert_eq!(header(&response, "Vary"), Some("Accept-Language"));
+    assert_eq!(header(&response, "Content-Language"), None);
+}
+
+#[test]
 fn lang_flag_wins_over_accept_language() {
     let server = Server::start(&["--lang", "nl"]);
     let response = request(
@@ -260,17 +310,21 @@ fn text_flag_replaces_the_greeting() {
 #[test]
 fn startup_line_reports_the_language() {
     let server = Server::start(&["--lang", "nl"]);
-    assert!(
-        server.startup.contains("(language: nl)"),
-        "unexpected startup line: {:?}",
-        server.startup
+    assert_eq!(
+        server.startup,
+        format!(
+            "helloworld listening on http://127.0.0.1:{} (language: nl)",
+            server.port
+        )
     );
 
     let server = Server::start(&["--text", "hi"]);
-    assert!(
-        server.startup.contains("(language: custom (--text))"),
-        "unexpected startup line: {:?}",
-        server.startup
+    assert_eq!(
+        server.startup,
+        format!(
+            "helloworld listening on http://127.0.0.1:{} (language: custom (--text))",
+            server.port
+        )
     );
 }
 
@@ -318,23 +372,64 @@ fn head_healthz_has_no_body() {
 #[test]
 fn head_unknown_path_is_404_without_body() {
     let server = Server::start(&[]);
-    let response = request(
-        server.port,
-        "HEAD /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    );
+    let raw = "HEAD /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = request(server.port, raw);
     assert_eq!(status(&response), "HTTP/1.1 404 Not Found");
+    assert_eq!(header(&response, "Content-Length"), Some("10"));
     assert_eq!(body(&response), "");
+
+    // A GET of the same request carries that body.
+    let get = request(
+        server.port,
+        "GET /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&get), "HTTP/1.1 404 Not Found");
+    assert_eq!(header(&get, "Content-Length"), Some("10"));
+    assert_eq!(body(&get), "not found\n");
 }
 
 #[test]
 fn head_error_response_has_no_body() {
     let server = Server::start(&[]);
-    let response = request(
-        server.port,
-        &format!("HEAD /{}\r\nHost: localhost\r\n\r\n", "a".repeat(9000)),
-    );
+    let raw = format!("HEAD /{}\r\nHost: localhost\r\n\r\n", "a".repeat(9000));
+    let response = request(server.port, &raw);
     assert_eq!(status(&response), "HTTP/1.1 414 URI Too Long");
+    assert_eq!(header(&response, "Content-Length"), Some("22"));
     assert_eq!(body(&response), "");
+
+    // A GET of the same request carries that body.
+    let get = request(
+        server.port,
+        &format!("GET /{}\r\nHost: localhost\r\n\r\n", "a".repeat(9000)),
+    );
+    assert_eq!(status(&get), "HTTP/1.1 414 URI Too Long");
+    assert_eq!(header(&get, "Content-Length"), Some("22"));
+    assert_eq!(body(&get), "request line too long\n");
+
+    // An oversized header block is the same parity at `Content-Length: 18`.
+    let head = request(
+        server.port,
+        &format!(
+            "HEAD / HTTP/1.1\r\nHost: localhost\r\nX: {}\r\n\r\n",
+            "a".repeat(9000)
+        ),
+    );
+    assert_eq!(
+        status(&head),
+        "HTTP/1.1 431 Request Header Fields Too Large"
+    );
+    assert_eq!(header(&head, "Content-Length"), Some("18"));
+    assert_eq!(body(&head), "");
+    let get = request(
+        server.port,
+        &format!(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nX: {}\r\n\r\n",
+            "a".repeat(9000)
+        ),
+    );
+    assert_eq!(status(&get), "HTTP/1.1 431 Request Header Fields Too Large");
+    assert_eq!(header(&get, "Content-Length"), Some("18"));
+    assert_eq!(body(&get), "headers too large\n");
 }
 
 #[test]
@@ -416,8 +511,9 @@ fn access_log_line_matches_the_contract() {
     assert_eq!(status(&response), "HTTP/1.1 200 OK");
 
     let line = server.next_log_line();
-    let mut fields = line.split(' ');
-    let timestamp = fields.next().expect("timestamp field");
+    let fields: Vec<&str> = line.split(' ').collect();
+    assert_eq!(fields.len(), 7, "expected 7 fields: {line:?}");
+    let timestamp = fields[0];
     assert!(
         timestamp.len() == 20
             && timestamp.ends_with('Z')
@@ -425,7 +521,7 @@ fn access_log_line_matches_the_contract() {
             && timestamp.as_bytes()[10] == b'T',
         "timestamp is not ISO8601 UTC: {timestamp:?}"
     );
-    let peer = fields.next().expect("peer field");
+    let peer = fields[1];
     assert!(
         peer == "-" || peer.starts_with("127.0.0.1:"),
         "unexpected peer field: {peer:?}"
@@ -435,6 +531,24 @@ fn access_log_line_matches_the_contract() {
         "unexpected access log line: {line:?}"
     );
     assert!(line.ends_with("ms\n"), "missing duration: {line:?}");
+    let duration = fields[6]
+        .strip_prefix("dur=")
+        .and_then(|value| value.strip_suffix("ms\n"))
+        .expect("dur= field");
+    let (whole, fraction) = duration.split_once('.').expect("one decimal digit");
+    assert!(
+        !whole.is_empty() && whole.bytes().all(|b| b.is_ascii_digit()),
+        "duration has no whole part: {line:?}"
+    );
+    assert_eq!(
+        fraction.len(),
+        1,
+        "duration needs one decimal digit: {line:?}"
+    );
+    assert!(
+        fraction.bytes().all(|b| b.is_ascii_digit()),
+        "duration fraction is not a digit: {line:?}"
+    );
 }
 
 #[test]
@@ -567,7 +681,7 @@ fn slow_request_body_times_out() {
 
 #[test]
 fn over_capacity_returns_503() {
-    let server = Server::start(&[]);
+    let mut server = Server::start(&[]);
     // Track the documented connection cap by probing after each idle connection
     // rather than hardcoding it.
     let mut idle: Vec<TcpStream> = Vec::new();
@@ -583,12 +697,18 @@ fn over_capacity_returns_503() {
         }
     }
     assert_eq!(status(&response), "HTTP/1.1 503 Service Unavailable");
-    assert!(
-        header(&response, "Retry-After").is_some(),
-        "was {response:?}"
-    );
+    assert_eq!(header(&response, "Retry-After"), Some("1"));
     // The rejection is bodyless, so it is also correct for `HEAD`.
     assert_eq!(body(&response), "");
+    // Every probe before the rejection is logged too, so drain until the 503 line.
+    let mut line = server.next_log_line();
+    for _ in 0..512 {
+        if line.contains("status=503") {
+            break;
+        }
+        line = server.next_log_line();
+    }
+    assert!(line.contains("status=503"), "was {line:?}");
     drop(idle);
 }
 

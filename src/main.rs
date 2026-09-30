@@ -95,6 +95,15 @@ fn print_stdout(text: &str) {
     let _ = handle.flush();
 }
 
+/// Write `text` to stderr, ignoring I/O errors so a full or closed stderr never
+/// panics.
+fn print_stderr(text: &str) {
+    let stderr = io::stderr();
+    let mut handle = stderr.lock();
+    let _ = handle.write_all(text.as_bytes());
+    let _ = handle.flush();
+}
+
 /// Fetch the value of `name`, either inline (`--flag=value`) or from the next argument.
 fn flag_value(
     argv: &[String],
@@ -212,8 +221,8 @@ fn main() {
     let command = match parse_args(&argv) {
         Ok(command) => command,
         Err(message) => {
-            eprintln!("helloworld: {message}");
-            eprintln!("try 'helloworld --help' for usage");
+            print_stderr(&format!("helloworld: {message}\n"));
+            print_stderr("try 'helloworld --help' for usage\n");
             process::exit(2);
         }
     };
@@ -238,7 +247,7 @@ fn main() {
     let listener = match TcpListener::bind(addr) {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("helloworld: failed to bind {addr}: {err}");
+            print_stderr(&format!("helloworld: failed to bind {addr}: {err}\n"));
             process::exit(1);
         }
     };

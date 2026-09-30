@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::i18n;
+use crate::print_stderr;
 
 /// Largest accepted request line, excluding the trailing CRLF.
 const MAX_REQUEST_LINE: usize = 8 * 1024;
@@ -102,62 +103,49 @@ struct RequestInfo {
 /// threads, and any beyond both budgets are closed immediately. Accept errors
 /// back off briefly instead of spinning.
 pub fn serve(listener: TcpListener, config: Arc<Config>) {
-    let active = Arc::new(AtomicUsize::new(0));
-    let rejects = Arc::new(AtomicUsize::new(0));
+    let budget = Budget::new();
     let logger = Logger::start();
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
                 // Reserve the slot before spawning so the count can never exceed
                 // the cap: two threads racing here cannot both observe a free slot.
-                let previous = active.fetch_add(1, Ordering::Relaxed);
-                if previous >= MAX_CONNECTIONS + MAX_REJECTS {
+                let admission = budget.admit();
+                if matches!(admission, Admission::Refuse) {
                     // No capacity left to answer: closing still sheds the load.
-                    active.fetch_sub(1, Ordering::Relaxed);
                     continue;
                 }
-                // Rejections are budgeted separately, so a burst of `503`s cannot
-                // consume the capacity meant for served connections.
-                let busy = previous >= MAX_CONNECTIONS;
-                let reject_slot = if busy {
-                    let previous_rejects = rejects.fetch_add(1, Ordering::Relaxed);
-                    if previous_rejects >= MAX_REJECTS {
-                        rejects.fetch_sub(1, Ordering::Relaxed);
-                        active.fetch_sub(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    Some(Arc::clone(&rejects))
-                } else {
-                    None
-                };
+                let served = matches!(admission, Admission::Serve);
                 // The guard is moved into the closure, so a failed spawn drops it
-                // and with it both reservations.
-                let guard = ActiveGuard {
-                    active: Arc::clone(&active),
-                    rejects: reject_slot,
+                // and with it the reservation.
+                let slot = Slot {
+                    budget: budget.clone(),
+                    admission,
                 };
-                let config = if busy {
-                    None
-                } else {
+                let config = if served {
                     Some(Arc::clone(&config))
+                } else {
+                    None
                 };
                 let logger = logger.clone();
                 let started = Instant::now();
-                let name = if busy {
-                    "helloworld-reject"
-                } else {
+                let name = if served {
                     "helloworld-conn"
+                } else {
+                    "helloworld-reject"
                 };
                 let spawned = thread::Builder::new()
                     .name(name.to_string())
                     .stack_size(HANDLER_STACK)
                     .spawn(move || {
-                        let _guard = guard;
+                        let _slot = slot;
                         match config {
                             Some(config) => {
                                 if let Err(err) = handle_connection(stream, &config, &logger) {
                                     if !is_disconnect(&err) {
-                                        eprintln!("helloworld: connection error: {err}");
+                                        print_stderr(&format!(
+                                            "helloworld: connection error: {err}\n"
+                                        ));
                                     }
                                 }
                             }
@@ -165,30 +153,82 @@ pub fn serve(listener: TcpListener, config: Arc<Config>) {
                         }
                     });
                 if let Err(err) = spawned {
-                    eprintln!("helloworld: failed to spawn handler: {err}");
+                    print_stderr(&format!("helloworld: failed to spawn handler: {err}\n"));
                 }
             }
             Err(err) => {
-                eprintln!("helloworld: accept failed: {err}");
+                print_stderr(&format!("helloworld: accept failed: {err}\n"));
                 thread::sleep(ACCEPT_BACKOFF);
             }
         }
     }
 }
 
-/// Decrements the connection counters when a worker thread ends.
-struct ActiveGuard {
-    /// Live connection threads, served and rejecting alike.
-    active: Arc<AtomicUsize>,
-    /// Live reject threads, when this thread answers `503`.
-    rejects: Option<Arc<AtomicUsize>>,
+/// Independent admission budgets for served and rejected connections.
+#[derive(Clone)]
+struct Budget {
+    /// Slots in use by served connections.
+    served: Arc<AtomicUsize>,
+    /// Slots in use by reject threads.
+    rejects: Arc<AtomicUsize>,
 }
 
-impl Drop for ActiveGuard {
+/// How an accepted connection was admitted.
+enum Admission {
+    /// Serve the connection on a handler thread.
+    Serve,
+    /// Answer the connection with `503` on a reject thread.
+    Reject,
+    /// Close the connection immediately.
+    Refuse,
+}
+
+impl Budget {
+    /// Create a budget with both counters at zero.
+    fn new() -> Self {
+        Self {
+            served: Arc::new(AtomicUsize::new(0)),
+            rejects: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Reserve a slot for one connection, or report that none is left.
+    ///
+    /// The served and reject budgets are independent, so live reject threads never
+    /// consume a served slot.
+    fn admit(&self) -> Admission {
+        let previous = self.served.fetch_add(1, Ordering::Relaxed);
+        if previous < MAX_CONNECTIONS {
+            return Admission::Serve;
+        }
+        self.served.fetch_sub(1, Ordering::Relaxed);
+        let previous = self.rejects.fetch_add(1, Ordering::Relaxed);
+        if previous < MAX_REJECTS {
+            return Admission::Reject;
+        }
+        self.rejects.fetch_sub(1, Ordering::Relaxed);
+        Admission::Refuse
+    }
+}
+
+/// Returns a connection's slot to its budget when the thread ends.
+struct Slot {
+    /// Budget the slot was taken from.
+    budget: Budget,
+    /// Which counter the slot holds.
+    admission: Admission,
+}
+
+impl Drop for Slot {
     fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::Relaxed);
-        if let Some(rejects) = &self.rejects {
-            rejects.fetch_sub(1, Ordering::Relaxed);
+        match self.admission {
+            Admission::Serve => {
+                self.budget.served.fetch_sub(1, Ordering::Relaxed);
+            }
+            Admission::Reject => {
+                self.budget.rejects.fetch_sub(1, Ordering::Relaxed);
+            }
+            Admission::Refuse => {}
         }
     }
 }
@@ -447,7 +487,10 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
     // Skip any leading blank lines, then read the request line.
     let request_line = loop {
         match read_line(reader, MAX_REQUEST_LINE, &mut buf, deadline) {
-            Err(err) => return timeout_or(err, false),
+            Err(err) => {
+                let head_only = line_method(&buf) == "HEAD";
+                return timeout_or(err, head_only);
+            }
             Ok(ReadLine::Eof) => return Ok(None),
             Ok(ReadLine::TooLong) => {
                 let method = line_method(&buf);
@@ -552,7 +595,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                 if line.is_empty() {
                     break;
                 }
-                header_bytes += line.len() + 2;
+                header_bytes += buf.len() + 2;
                 if header_bytes > MAX_HEADER_BYTES || headers.len() >= MAX_HEADERS {
                     return fail(
                         writer,
@@ -612,6 +655,19 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                 headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
             }
         }
+    }
+
+    // A valid `Host` is required for HTTP/1.1 before any framing decision
+    // (RFC 7230 5.4), so a bad one is always a 400.
+    if !host_is_valid(version, &headers) {
+        return fail(
+            writer,
+            method,
+            &path,
+            "400 Bad Request",
+            "bad request\n",
+            head_only,
+        );
     }
 
     // A body is drained, never buffered, so a chunked request is unsupported.
@@ -683,17 +739,6 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
         );
     }
 
-    if !host_is_valid(version, &headers) {
-        return fail(
-            writer,
-            method,
-            &path,
-            "400 Bad Request",
-            "bad request\n",
-            head_only,
-        );
-    }
-
     match header(&headers, "expect") {
         // An HTTP/1.0 client cannot understand 1xx; ignore the expectation
         // (RFC 7231 5.1.1) and read the body as usual.
@@ -750,10 +795,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
         Vec<(&'static str, &'static str)>,
     ) = match method {
         "GET" | "HEAD" => match path.as_str() {
-            "/" => {
-                let (lang, body, extra) = greeting(config, &headers);
-                ("200 OK", lang, body, extra)
-            }
+            "/" => greeting(config, &headers),
             "/healthz" => ("200 OK", "-".to_string(), "ok\n".to_string(), Vec::new()),
             _ => (
                 "404 Not Found",
@@ -831,34 +873,45 @@ fn fail<W: Write>(
 /// Follows the documented precedence: `--text`, then `--lang`, then
 /// `Accept-Language`, then the default. `Content-Language` (and `Vary` for
 /// negotiation) reflects the language actually served; `--text` serves a fixed
-/// string, so it advertises neither.
+/// string, so it advertises neither. A header that leaves no catalog language
+/// acceptable is answered with `406 Not Acceptable`.
 fn greeting(
     config: &Config,
     headers: &[(String, String)],
-) -> (String, String, Vec<(&'static str, &'static str)>) {
+) -> (
+    &'static str,
+    String,
+    String,
+    Vec<(&'static str, &'static str)>,
+) {
     if let Some(text) = &config.text {
         let mut body = text.clone();
         body.push('\n');
-        return ("custom".to_string(), body, Vec::new());
+        return ("200 OK", "custom".to_string(), body, Vec::new());
     }
     if let Some(code) = config.lang {
         return (
+            "200 OK",
             code.to_string(),
             format!("{}\n", i18n::greeting_for(code)),
             vec![("Content-Language", code)],
         );
     }
-    let negotiated = header(headers, "accept-language")
-        .and_then(i18n::negotiate)
-        .unwrap_or(i18n::DEFAULT_CODE);
-    (
-        negotiated.to_string(),
-        format!("{}\n", i18n::greeting_for(negotiated)),
-        vec![
-            ("Content-Language", negotiated),
-            ("Vary", "Accept-Language"),
-        ],
-    )
+    let combined = combined_header(headers, "accept-language");
+    match i18n::negotiate(combined.as_deref().unwrap_or("")) {
+        i18n::Negotiated::Language(code) => (
+            "200 OK",
+            code.to_string(),
+            format!("{}\n", i18n::greeting_for(code)),
+            vec![("Content-Language", code), ("Vary", "Accept-Language")],
+        ),
+        i18n::Negotiated::NotAcceptable => (
+            "406 Not Acceptable",
+            "-".to_string(),
+            "not acceptable\n".to_string(),
+            vec![("Vary", "Accept-Language")],
+        ),
+    }
 }
 
 /// First value of the named (lowercase) header, if present.
@@ -867,6 +920,27 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .iter()
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.as_str())
+}
+
+/// Join every value of the named (lowercase) header in order with `", "`.
+///
+/// Multiple field lines with the same name are equivalent to one comma-separated
+/// list (RFC 9110 5.3), so callers that need the whole list use this instead of
+/// [`header`]. Returns `None` when the header is absent.
+fn combined_header(headers: &[(String, String)], name: &str) -> Option<String> {
+    let mut joined: Option<String> = None;
+    for (key, value) in headers {
+        if key == name {
+            match &mut joined {
+                Some(existing) => {
+                    existing.push_str(", ");
+                    existing.push_str(value);
+                }
+                None => joined = Some(value.clone()),
+            }
+        }
+    }
+    joined
 }
 
 /// Whether `name` is a valid HTTP `token` (RFC 7230 3.2.6).
@@ -1086,7 +1160,7 @@ impl Logger {
                 }
             });
         if let Err(err) = spawned {
-            eprintln!("helloworld: failed to spawn log writer: {err}");
+            print_stderr(&format!("helloworld: failed to spawn log writer: {err}\n"));
         }
         Logger { sender }
     }
@@ -1121,17 +1195,24 @@ fn log_line(peer: Option<SocketAddr>, info: &RequestInfo, elapsed: Duration) -> 
     )
 }
 
-/// Replace control characters and truncate to [`MAX_LOG_FIELD`] characters.
+/// Replace control characters and truncate a field longer than [`MAX_LOG_FIELD`].
+///
+/// A field of at most [`MAX_LOG_FIELD`] characters is logged unchanged (apart from
+/// control characters becoming `?`); a longer one becomes its first
+/// `MAX_LOG_FIELD - 3` characters followed by `...`.
 fn sanitize(value: &str) -> String {
-    let mut out: String = value
-        .chars()
-        .take(MAX_LOG_FIELD - 3)
-        .map(|ch| if ch.is_control() { '?' } else { ch })
-        .collect();
-    if value.chars().nth(MAX_LOG_FIELD - 3).is_some() {
+    let escaped = || {
+        value
+            .chars()
+            .map(|ch| if ch.is_control() { '?' } else { ch })
+    };
+    if value.chars().count() > MAX_LOG_FIELD {
+        let mut out: String = escaped().take(MAX_LOG_FIELD - 3).collect();
         out.push_str("...");
+        out
+    } else {
+        escaped().collect()
     }
-    out
 }
 
 #[cfg(test)]
@@ -1343,6 +1424,24 @@ mod tests {
     }
 
     #[test]
+    fn missing_host_beats_payload_too_large() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nContent-Length: 8388609\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
+    fn missing_host_beats_not_implemented() {
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+    }
+
+    #[test]
     fn overflowing_content_length_is_payload_too_large() {
         let (_, info) = run(
             "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 99999999999999999999\r\n\r\n",
@@ -1504,6 +1603,51 @@ mod tests {
     }
 
     #[test]
+    fn combined_accept_language_lines_are_joined_in_order() {
+        let headers = vec![
+            ("accept-language".to_string(), "de;q=0.1".to_string()),
+            ("accept-language".to_string(), "ja;q=1".to_string()),
+        ];
+        assert_eq!(
+            combined_header(&headers, "accept-language").as_deref(),
+            Some("de;q=0.1, ja;q=1")
+        );
+        assert_eq!(combined_header(&headers, "accept"), None);
+
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: de;q=0.1\r\nAccept-Language: ja;q=1\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").lang, "ja");
+        assert_eq!(header_value(&response, "Content-Language"), Some("ja"));
+    }
+
+    #[test]
+    fn unacceptable_header_is_406_with_vary() {
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: en;q=0\r\n\r\n",
+            &default_config(),
+        );
+        let info = info.expect("served");
+        assert_eq!(info.status, "406 Not Acceptable");
+        assert_eq!(info.lang, "-");
+        assert_eq!(body(&response), "not acceptable\n");
+        assert_eq!(header_value(&response, "Vary"), Some("Accept-Language"));
+        assert_eq!(header_value(&response, "Content-Language"), None);
+    }
+
+    #[test]
+    fn acceptable_header_is_200_with_language_and_vary() {
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: de\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "200 OK");
+        assert_eq!(header_value(&response, "Content-Language"), Some("de"));
+        assert_eq!(header_value(&response, "Vary"), Some("Accept-Language"));
+    }
+
+    #[test]
     fn negotiated_route_advertises_language_and_vary() {
         let (response, _) = run(
             "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: de\r\n\r\n",
@@ -1550,6 +1694,50 @@ mod tests {
         );
         assert_eq!(header_value(&missing, "Content-Language"), None);
         assert_eq!(header_value(&missing, "Vary"), None);
+    }
+
+    #[test]
+    fn budget_serves_up_to_the_connection_cap() {
+        let budget = Budget::new();
+        for _ in 0..MAX_CONNECTIONS {
+            assert!(matches!(budget.admit(), Admission::Serve));
+        }
+        assert!(matches!(budget.admit(), Admission::Reject));
+    }
+
+    #[test]
+    fn budget_rejects_are_capped() {
+        let budget = Budget::new();
+        for _ in 0..MAX_CONNECTIONS {
+            assert!(matches!(budget.admit(), Admission::Serve));
+        }
+        for _ in 0..MAX_REJECTS {
+            assert!(matches!(budget.admit(), Admission::Reject));
+        }
+        assert!(matches!(budget.admit(), Admission::Refuse));
+    }
+
+    #[test]
+    fn budget_keeps_rejects_from_consuming_served_slots() {
+        let budget = Budget::new();
+        for _ in 0..MAX_CONNECTIONS - 1 {
+            assert!(matches!(budget.admit(), Admission::Serve));
+        }
+        // Live reject threads must not shrink the served budget.
+        budget.rejects.store(MAX_REJECTS, Ordering::Relaxed);
+        assert!(matches!(budget.admit(), Admission::Serve));
+    }
+
+    #[test]
+    fn slot_returns_its_counter_on_drop() {
+        let budget = Budget::new();
+        let slot = Slot {
+            budget: budget.clone(),
+            admission: budget.admit(),
+        };
+        assert_eq!(budget.served.load(Ordering::Relaxed), 1);
+        drop(slot);
+        assert_eq!(budget.served.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1636,10 +1824,12 @@ mod tests {
     #[test]
     fn sanitize_escapes_and_truncates() {
         assert_eq!(sanitize("a\n\u{1b}b"), "a??b");
-        let long = "x".repeat(200);
-        let sanitized = sanitize(&long);
+        let exact = "x".repeat(MAX_LOG_FIELD);
+        assert_eq!(sanitize(&exact), exact);
+        let over = "x".repeat(MAX_LOG_FIELD + 1);
+        let sanitized = sanitize(&over);
         assert_eq!(sanitized.len(), MAX_LOG_FIELD);
-        assert_eq!(&sanitized[..MAX_LOG_FIELD - 3], &long[..MAX_LOG_FIELD - 3]);
+        assert_eq!(&sanitized[..MAX_LOG_FIELD - 3], &over[..MAX_LOG_FIELD - 3]);
         assert!(sanitized.ends_with("..."));
     }
 
@@ -1906,6 +2096,23 @@ mod tests {
     }
 
     #[test]
+    fn head_stalled_inside_the_request_line_has_no_body() {
+        let request = "HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        // Four trickled bytes spell `HEAD`, so the method is known before the
+        // deadline expires inside the request line.
+        let mut reader = BufReader::new(Trickle::new(request.as_bytes().to_vec()));
+        let (response, info) = run_deadline(
+            &mut reader,
+            &default_config(),
+            &mut CountdownDeadline { arms: 4 },
+        );
+        let info = info.expect("served");
+        assert_eq!(info.status, "408 Request Timeout");
+        assert_eq!(header_value(&response, "Content-Length"), Some("16"));
+        assert_eq!(body(&response), "");
+    }
+
+    #[test]
     fn head_timeout_has_no_body() {
         let request = "HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n";
         // The request line is trickled and read in full, so `HEAD` is known,
@@ -1978,6 +2185,31 @@ mod tests {
         assert_eq!(
             info.expect("served").status,
             "431 Request Header Fields Too Large"
+        );
+    }
+
+    #[test]
+    fn header_bytes_are_counted_on_the_wire() {
+        // Three maximal header lines of raw `0xFF` bytes are under 64 KiB on the
+        // wire, but would exceed it if the lossy UTF-8 expansion were counted.
+        let pad = MAX_HEADER_LINE - "X-Pad: ".len();
+        let mut request = b"GET / HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        for _ in 0..3 {
+            request.extend_from_slice(b"X-Pad: ");
+            request.resize(request.len() + pad, 0xff);
+            request.extend_from_slice(b"\r\n");
+        }
+        request.extend_from_slice(b"\r\n");
+        assert!(request.len() < MAX_HEADER_BYTES);
+        let mut reader = BufReader::new(Cursor::new(request));
+        let mut writer = Vec::new();
+        let info = handle(&mut reader, &mut writer, &default_config(), &mut ())
+            .expect("handle must succeed")
+            .expect("served");
+        assert_eq!(info.status, "200 OK");
+        assert_eq!(
+            body(&String::from_utf8(writer).expect("utf-8")),
+            "Hello, World!\n"
         );
     }
 

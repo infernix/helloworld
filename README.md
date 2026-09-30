@@ -83,7 +83,7 @@ Requests that exceed the parser's limits are rejected with a short plain-text bo
 | Request line longer than 8 KiB                               | `414 URI Too Long`                  |
 | Single header line longer than 8 KiB, headers larger than 64 KiB in total, or more than 100 fields | `431 Request Header Fields Too Large` |
 | Request body larger than 8 MiB, or a `Content-Length` above 8 MiB (checked before the body is read) | `413 Payload Too Large` |
-| Body sent with `Transfer-Encoding` (chunked)                  | `501 Not Implemented`               |
+| Any request carrying a `Transfer-Encoding` header               | `501 Not Implemented`               |
 | Version token that is not `HTTP/...`                          | `400 Bad Request`                   |
 | `HTTP` major version other than 1, or an `HTTP/1.x` minor that is empty or not numeric | `505 HTTP Version Not Supported` |
 | Malformed request line, method or request target              | `400 Bad Request`                   |
@@ -103,8 +103,11 @@ A higher `HTTP/1.x` minor version such as `HTTP/1.2` is processed as HTTP/1.1 (R
 
 The parser is lenient in a few places: a bare LF is accepted as a line terminator, EOF inside the header
 block ends the head (the request is served as if the blank line had arrived), and a duplicate `Host` is rejected
-for HTTP/1.0 as well as HTTP/1.1. The `Host` value is not validated as an authority, since it is not used for
-routing.
+for HTTP/1.0 as well as HTTP/1.1. Multiple `Accept-Language` field lines are combined in order, as if they had
+been sent as one comma-separated list (RFC 9110 5.3). Each `q` weight must match the RFC 9110 `qvalue` grammar
+`qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] )`, so `0`, `0.5`, `0.125`, `1` and `1.000` are
+accepted while `.5`, `00.5`, `+0.5`, `1e-1`, `0.0001`, `0.1234` and `1.5` are not; a malformed weight drops that
+entry. The `Host` value is not validated as an authority, since it is not used for routing.
 
 ### Access log
 
@@ -139,12 +142,15 @@ served and its response is unaffected.
 
 ## Endpoints
 
-| Request                    | Response                                                              |
-| -------------------------- | --------------------------------------------------------------------- |
-| `GET /`, `HEAD /`          | `200 OK`, the greeting + newline                                       |
-| `GET /healthz`, `HEAD /healthz` | `200 OK`, body `ok` and a newline                                  |
-| any other path             | `404 Not Found`, short plain-text body                                  |
-| any other method           | `405 Method Not Allowed`, `Allow: GET, HEAD`, short plain-text body     |
+| Request                        | Response                                                                |
+| ------------------------------ | ----------------------------------------------------------------------- |
+| `GET /`, `HEAD /`              | `200 OK`, the greeting + newline, or `406 Not Acceptable`                 |
+| `GET /healthz`, `HEAD /healthz` | `200 OK`, body `ok` and a newline                                        |
+| any other path                 | `404 Not Found`, short plain-text body                                    |
+| any other method               | `405 Method Not Allowed`, `Allow: GET, HEAD`, short plain-text body         |
+
+`GET /` is answered with `406 Not Acceptable` when the request's `Accept-Language` header leaves no
+catalog language acceptable (see [Greeting resolution precedence](#greeting-resolution-precedence)).
 
 `HEAD` returns exactly the same status and headers as the corresponding `GET`, with no body. That holds for
 error and timeout responses too: a `400`, `408`, `414`, `431`, `505` or `503` answered to a `HEAD` request
@@ -172,10 +178,10 @@ For every request to `/`, the greeting is resolved in this order:
 
 1. `--text <STRING>` — if given, it replaces the greeting for **every** request, regardless of language.
 2. `--lang <CODE>` — if given, that language is used for every request, ignoring request headers.
-3. The request's `Accept-Language` header — the first supported tag wins, honoring `q=` ordering.
-   A wildcard `*` matches every language not named by another entry, so it resolves to `en` unless the
-   header names `en`, in which case it resolves to the first other catalog language. An entry whose `q` is
-   zero, missing a value or malformed is disabled.
+3. The request's `Accept-Language` header — the highest-quality catalog language wins, where an
+   exact range beats the `*` wildcard and a language marked `q=0` is never served. A header that leaves
+   no catalog language acceptable is answered `406 Not Acceptable`; an absent, empty or malformed header
+   keeps the `en` default.
 4. `en` — the default.
 
 A plain `curl http://127.0.0.1:21212/` with no language arguments or headers therefore still returns
@@ -261,9 +267,9 @@ cargo test
 This runs the unit tests and the `tests/cli.rs` integration suite, which starts the real binary on an
 ephemeral port (`--port 0`) and speaks HTTP to it.
 
-CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, the test suite, a rustdoc build
-with warnings denied, and a release build on the stable toolchain, plus the test suite and release build on the
-MSRV toolchain.
+CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, the test suite in both the
+debug and release profiles, and a rustdoc build with warnings denied on the stable toolchain, plus the test
+suite and release build on the MSRV toolchain.
 
 ## License
 
