@@ -893,6 +893,113 @@ fn over_capacity_returns_503() {
 }
 
 #[test]
+fn only_ows_is_trimmed_from_field_values() {
+    let server = Server::start(&[]);
+    // Optional whitespace is SP and HTAB only (RFC 9110 5.6.3), so a non-ASCII
+    // space stays in the field value and the framing field rejects it.
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: \u{a0}5\r\nConnection: close\r\n\r\nhello",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: \u{a0}evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: \t5 \t\r\nConnection: close\r\n\r\nhello",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+}
+
+#[test]
+fn unicode_whitespace_in_the_request_line_is_400() {
+    let server = Server::start(&[]);
+    // The RFC 9112 3 separators are SP, HTAB, VT, FF and bare CR; a non-ASCII
+    // space is part of the token, so the line is not a valid request line.
+    let response = request(
+        server.port,
+        "GET\u{a0}/\u{a0}HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+    assert_eq!(body(&response), "bad request\n");
+}
+
+#[test]
+fn fragment_in_the_target_is_400() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET /#f HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
+fn multi_digit_version_is_400() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.10\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 400 Bad Request");
+}
+
+#[test]
+fn absolute_form_is_routed_by_path_for_every_scheme() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET ftp://example.com/healthz HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&response), "HTTP/1.1 200 OK");
+    assert_eq!(body(&response), "ok\n");
+}
+
+#[test]
+fn expect_member_with_parameters_is_recognized() {
+    let server = Server::start(&[]);
+    let response = request(
+        server.port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue;q=1\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 100 Continue\r\n\r\n"),
+        "response was {response:?}"
+    );
+    let final_response = response
+        .strip_prefix("HTTP/1.1 100 Continue\r\n\r\n")
+        .expect("100 Continue prefix");
+    assert_eq!(status(final_response), "HTTP/1.1 200 OK");
+    assert_eq!(body(final_response), "Hello, World!\n");
+}
+
+#[test]
+fn marker_with_a_value_is_a_usage_error() {
+    let (code, stdout, stderr) = run(&["--=nl"]);
+    assert_eq!(code, 2);
+    assert!(stdout.is_empty(), "unexpected stdout {stdout:?}");
+    assert!(
+        stderr.contains("unknown argument '--=nl'"),
+        "unexpected stderr {stderr:?}"
+    );
+}
+
+#[test]
+fn brackets_around_an_ipv4_host_are_a_usage_error() {
+    let (code, _, stderr) = run(&["--host", "[127.0.0.1]"]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("invalid host '[127.0.0.1]'"),
+        "unexpected stderr {stderr:?}"
+    );
+}
+
+#[test]
 fn bind_failure_exits_one() {
     let server = Server::start(&[]);
     let port = server.port.to_string();

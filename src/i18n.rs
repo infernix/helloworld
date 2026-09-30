@@ -232,8 +232,10 @@ fn language_range_is_valid(tag: &str) -> bool {
 
 /// Parse a weighted list into `(quality, tag)` pairs.
 ///
-/// Entries are split on `,`; the tag is everything before the first `;`. The
-/// weight defaults to `1.0` and is set by a `q=value` parameter (matched
+/// Entries are split on `,`; the tag is everything before the first `;`. Optional
+/// whitespace is only SP and HTAB (RFC 9110 5.6.3), so any other whitespace
+/// stays in the tag and the field that owns it rejects the entry. The weight
+/// defaults to `1.0` and is set by a `q=value` parameter (matched
 /// case-insensitively) whose value is validated by `parse_qvalue`; a malformed or
 /// missing weight drops the whole entry. Later `q` parameters override earlier
 /// ones, and other parameters are ignored. The tag itself is not validated, so the
@@ -242,21 +244,21 @@ fn language_range_is_valid(tag: &str) -> bool {
 pub fn parse_weighted_list(header: &str) -> Vec<(f32, &str)> {
     let mut entries: Vec<(f32, &str)> = Vec::new();
     for raw in header.split(',') {
-        let raw = raw.trim();
+        let raw = crate::http::trim_ows(raw);
         if raw.is_empty() {
             continue;
         }
         let mut parts = raw.split(';');
-        let tag = parts.next().unwrap_or("").trim();
+        let tag = crate::http::trim_ows(parts.next().unwrap_or(""));
         if tag.is_empty() {
             continue;
         }
         let mut quality = Some(1.0_f32);
         for param in parts {
-            let param = param.trim();
+            let param = crate::http::trim_ows(param);
             match param.split_once('=') {
-                Some((name, value)) if name.trim().eq_ignore_ascii_case("q") => {
-                    quality = parse_qvalue(value.trim());
+                Some((name, value)) if crate::http::trim_ows(name).eq_ignore_ascii_case("q") => {
+                    quality = parse_qvalue(crate::http::trim_ows(value));
                 }
                 // A `q` with no value is malformed and drops the entry.
                 None if param.eq_ignore_ascii_case("q") => quality = None,
@@ -283,24 +285,35 @@ fn parse_entries(header: &str) -> Vec<(f32, &str)> {
 
 /// Weight of `code` under `entries`, using the most specific matching range.
 ///
-/// An exact range (any tag that is not `*` and whose [`normalize`]d form equals
-/// `code`) beats a `*` wildcard; within a specificity the highest weight wins.
+/// A range that exactly equals `code` (ASCII case-insensitive) is the most
+/// specific match, so it decides the weight even when another range carries extra
+/// subtags for the same primary subtag; a range whose primary subtag equals
+/// `code` (the lookup form, RFC 4647 3.4) is less specific, and the `*`
+/// wildcard is the least specific, matching only a tag no other range matched
+/// (RFC 9110 12.4.3). Within one specificity the highest weight wins.
 fn quality(entries: &[(f32, &str)], code: &str) -> Option<f32> {
-    let mut best: Option<f32> = None;
-    for &(weight, tag) in entries {
-        if tag != "*" && normalize(tag) == code {
-            best = Some(best.map_or(weight, |current| current.max(weight)));
-        }
-    }
-    if best.is_some() {
-        return best;
-    }
+    let mut exact: Option<f32> = None;
+    let mut primary: Option<f32> = None;
+    let mut wildcard: Option<f32> = None;
     for &(weight, tag) in entries {
         if tag == "*" {
-            best = Some(best.map_or(weight, |current| current.max(weight)));
+            wildcard = Some(wildcard.map_or(weight, |current| current.max(weight)));
+        } else if tag.eq_ignore_ascii_case(code) {
+            exact = Some(exact.map_or(weight, |current| current.max(weight)));
+        } else if primary_subtag_is(tag, code) {
+            primary = Some(primary.map_or(weight, |current| current.max(weight)));
         }
     }
-    best
+    exact.or(primary).or(wildcard)
+}
+
+/// Whether the primary subtag of `tag` equals `code` (ASCII case-insensitive).
+///
+/// The same comparison as `normalize(tag) == code`, without allocating a string
+/// per comparison.
+fn primary_subtag_is(tag: &str, code: &str) -> bool {
+    let primary = tag.split(['-', '_']).next().unwrap_or("");
+    primary.eq_ignore_ascii_case(code)
 }
 
 /// Outcome of `Accept-Language` negotiation.
@@ -317,9 +330,12 @@ pub enum Negotiated {
 /// Every entry's weight is parsed (default `1.0`); an entry whose weight is
 /// missing or malformed, or whose tag is not a `language-range` (RFC 4647 2.1),
 /// is ignored, and a valid weight of `0` makes that language not acceptable
-/// (RFC 9110 12.4.2). The most specific matching range decides,
-/// so an exact range beats `*`. The highest weight wins, with ties resolved in
-/// catalog order, and a header with no usable entry leaves the default acceptable.
+/// (RFC 9110 12.4.2). The most specific matching range decides the weight of a
+/// language, so a range that exactly names it beats a range that only shares its
+/// primary subtag, which in turn beats `*` (RFC 4647 3.3.1); a range that
+/// exactly names a language with weight `0` is therefore never overridden by a
+/// longer range. The highest weight wins, with ties resolved in catalog order,
+/// and a header with no usable entry leaves the default acceptable.
 pub fn negotiate(header: &str) -> Negotiated {
     let entries = parse_entries(header);
     let mut best: Option<(&'static str, f32)> = None;
@@ -476,6 +492,21 @@ mod tests {
         assert_eq!(negotiate("en-US;q=0.9"), lang("en"));
         assert_eq!(negotiate("en-abcdefgh;q=0.9"), lang("en"));
         assert_eq!(negotiate("xx;q=1"), Negotiated::NotAcceptable);
+    }
+
+    #[test]
+    fn negotiate_lets_an_exact_range_outrank_a_longer_one() {
+        // A range that exactly names a language decides its weight, so a longer
+        // range for the same primary subtag cannot override a weight of 0
+        // (RFC 4647 3.3.1, RFC 9110 12.4.2).
+        assert_eq!(negotiate("en-US, en;q=0"), Negotiated::NotAcceptable);
+        assert_eq!(negotiate("en;q=0, en-US;q=1"), Negotiated::NotAcceptable);
+        assert_eq!(negotiate("en-US, en;q=0.5"), lang("en"));
+
+        // Without an exact range, a range whose primary subtag is the language
+        // still matches it (the lookup form, RFC 4647 3.4).
+        assert_eq!(negotiate("en-US;q=0.9"), lang("en"));
+        assert_eq!(negotiate("nl-NL"), lang("nl"));
     }
 
     #[test]

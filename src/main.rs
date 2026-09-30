@@ -8,7 +8,7 @@ mod i18n;
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::process;
 use std::sync::Arc;
 
@@ -121,13 +121,19 @@ fn flag_value(
     }
 }
 
-/// Strip one pair of surrounding brackets, so the `[::1]` form the startup line
-/// prints can be passed back to `--host`.
-fn unbracket(value: &str) -> &str {
-    value
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(value)
+/// Strip one pair of surrounding brackets from an IPv6 address.
+///
+/// The startup line prints a bracketed IPv6 address, and that form is accepted
+/// back: a bracketed value must hold an IPv6 literal, while an unbracketed one
+/// is parsed as any IP address.
+fn parse_host(value: &str) -> Option<IpAddr> {
+    match value.strip_prefix('[') {
+        Some(bracketed) => bracketed
+            .strip_suffix(']')
+            .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
+            .map(IpAddr::V6),
+        None => value.parse::<IpAddr>().ok(),
+    }
 }
 
 /// Parse `argv` (program name already stripped) into a [`Command`].
@@ -148,7 +154,9 @@ fn parse_args(argv: &[String]) -> Result<Command, String> {
         };
 
         match name {
-            "--" => {}
+            // Only a value-less `--` is the end-of-options marker; `--=x`
+            // carries a value, so it is an unknown argument.
+            "--" if inline.is_none() => {}
             "-h" | "--help" => return Ok(Command::Help),
             "--list-langs" => return Ok(Command::ListLangs),
             "-V" | "--version" => return Ok(Command::Version),
@@ -186,9 +194,9 @@ fn parse_args(argv: &[String]) -> Result<Command, String> {
             }
             "--host" => {
                 let value = flag_value(argv, &mut index, name, inline)?;
-                match unbracket(&value).parse::<IpAddr>() {
-                    Ok(host) => options.host = host,
-                    Err(_) => {
+                match parse_host(&value) {
+                    Some(host) => options.host = host,
+                    None => {
                         return Err(format!(
                             "invalid host '{}' (expected an IP address)",
                             value.escape_debug()
@@ -196,7 +204,10 @@ fn parse_args(argv: &[String]) -> Result<Command, String> {
                     }
                 }
             }
-            other => return Err(format!("unknown argument '{}'", other.escape_debug())),
+            _ => {
+                // Name the whole argument, so an inline value is reported too.
+                return Err(format!("unknown argument '{}'", arg.escape_debug()));
+            }
         }
 
         index += 1;
@@ -465,6 +476,37 @@ mod tests {
     #[test]
     fn end_of_options_marker_is_ignored() {
         assert_eq!(run_options(&["--", "--lang", "nl"]).lang, Some("nl"));
+    }
+
+    #[test]
+    fn marker_with_a_value_is_an_unknown_argument() {
+        assert_eq!(
+            parse_args(&argv(&["--=nl"])),
+            Err("unknown argument '--=nl'".to_string())
+        );
+        assert_eq!(
+            parse_args(&argv(&["--="])),
+            Err("unknown argument '--='".to_string())
+        );
+    }
+
+    #[test]
+    fn brackets_are_only_accepted_around_an_ipv6_address() {
+        assert_eq!(
+            run_options(&["--host", "[::1]"]).host,
+            "::1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            run_options(&["--host", "[2001:db8::1]"]).host,
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+        for value in ["[127.0.0.1]", "[::1", "::1]", "[]"] {
+            assert_eq!(
+                parse_args(&argv(&["--host", value])),
+                Err(format!("invalid host '{value}' (expected an IP address)")),
+                "was {value:?}"
+            );
+        }
     }
 
     #[test]

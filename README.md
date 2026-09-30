@@ -48,13 +48,16 @@ Examples:
   curl -s -H 'Accept-Language: de-DE,de;q=0.9' http://127.0.0.1:21212/
 ```
 
-Flags accept both `--flag value` and `--flag=value` forms; a bare `--` is accepted and ignored. Unknown
+Flags accept both `--flag value` and `--flag=value` forms; a bare `--` is accepted and ignored, while
+`--=value` is an unknown argument. Unknown
 flags and flags whose value is missing exit non-zero with a message on stderr. An explicitly empty value is
 accepted: `--text ''` serves an empty greeting, while `--lang ''`, `--port ''` and `--host ''` fail their own
 validation with a message that names the real cause. An unsupported language code also exits non-zero, prints the
 error on stderr and lists the supported codes. A `--text` value longer than 8 KiB is rejected as a usage
 error: the program exits with status 2 and prints the error on stderr. `--host` accepts an IP address, with an
-optional pair of `[` `]` around an IPv6 address.
+optional pair of `[` `]` around an IPv6 address, so `--host '[::1]'` and `--host ::1` both work while
+`--host '[127.0.0.1]'` is rejected. `--lang` accepts a full language tag and reduces it to its primary
+subtag, so `--lang nl-NL` is the same as `--lang nl`.
 
 The server binds `<host>:<port>` (default `127.0.0.1:21212`) and handles each connection on its own
 thread, with at most 256 connections served at once. Connections beyond that limit are answered with
@@ -67,8 +70,8 @@ requests. Each connection uses a single file descriptor, so the 256-connection c
 default 1024-descriptor limit. Each connection has a 10s read timeout and a 10s write timeout, and the
 10s request deadline is enforced on every socket read, so a client that trickles the request head or body
 one byte at a time is still answered with `408` within 10 s. After the response is written
-the write side is half-closed and the read side drained for at most 500 ms in total before the socket is
-closed. On startup one line is printed with the address actually bound:
+the write side is half-closed and the read side drained for at most 500 ms or 64 KiB, whichever comes
+first, before the socket is closed. On startup one line is printed with the address actually bound:
 `helloworld listening on http://127.0.0.1:<port> (language: <en|custom (--text)|<code>>)`.
 
 Passing `--port 0` asks the OS for any free port; the startup line then prints the real port that was
@@ -83,38 +86,45 @@ Requests that exceed the parser's limits are rejected with a short plain-text bo
 | Request line longer than 8 KiB whose method token is complete (e.g. a long request target) | `414 URI Too Long`                  |
 | Request line longer than 8 KiB whose method token alone is longer than any the server implements | `501 Not Implemented`               |
 | Single header line longer than 8 KiB, headers larger than 64 KiB in total, or more than 100 fields | `431 Request Header Fields Too Large` |
-| Request body larger than 8 MiB, or a `Content-Length` above 8 MiB (checked before the body is read) | `413 Payload Too Large` |
+| Request body larger than 8 MiB, or a `Content-Length` above 8 MiB (checked before the body is read) | `413 Content Too Large` |
+| Body shorter than its `Content-Length` (EOF before the declared octets) | `400 Bad Request`                   |
 | A request whose final transfer coding is `chunked` (this server decodes no transfer coding) | `501 Not Implemented` |
 | A request whose final transfer coding is not `chunked`, or an HTTP/1.0 request carrying any `Transfer-Encoding` | `400 Bad Request` |
-| Version token that is not `HTTP/` followed by a non-empty run of digits, a `.`, and another non-empty run of digits (e.g. `HTTP/1.`, `HTTP/1.x`, `HTTP/1`) | `400 Bad Request`                   |
+| Version token that is not `HTTP/` followed by one digit, a `.`, and another digit (e.g. `HTTP/1.`, `HTTP/1.x`, `HTTP/1.10`) | `400 Bad Request` |
 | `HTTP` major version other than 1 (e.g. `HTTP/2.0`, `HTTP/9.9`) | `505 HTTP Version Not Supported`    |
 | Malformed request line, method, or a request target that matches none of the four request-target forms (origin-form, absolute-form, authority-form, asterisk-form; RFC 9112 3.2) | `400 Bad Request`                   |
 | Asterisk-form target (`*`) on a method other than `OPTIONS`    | `400 Bad Request`                   |
 | HTTP/1.1 request without exactly one valid `Host` header      | `400 Bad Request`                   |
 | `Host` field value that is not a valid `uri-host [":" port ]` (RFC 9110 7.2) | `400 Bad Request`                   |
 | `Content-Length` that is not a comma-separated list of valid decimal numerals with the same value (even when one of them overflows) | `400 Bad Request`                   |
-| Malformed header line: no colon, whitespace before the colon, a non-token field name, an obsolete folded continuation line, or a control character in the value | `400 Bad Request` |
+| Malformed header line: no colon, whitespace before the colon, a non-token field name, an obsolete folded continuation line, or a control character in the value other than HTAB | `400 Bad Request` |
 | `Accept-Encoding` that refuses the `identity` coding (RFC 9110 12.5.3) | `406 Not Acceptable`                |
 | `Expect` field value containing a member other than `100-continue` (RFC 9110 10.1.1) | `417 Expectation Failed`            |
 | Request head and body not complete within 10 s                  | `408 Request Timeout`               |
 
 `Expect: 100-continue` is answered with `100 Continue` only for HTTP/1.1 requests; in an HTTP/1.0
-request the expectation is ignored (RFC 7231) and the body is read as usual. The `Expect` field value is a
+request the expectation is ignored (RFC 9110 10.1.1) and the body is read as usual. The `Expect` field value is a
 list of expectations and multiple field lines are combined in order (RFC 9110 5.3), with empty list elements
 ignored (RFC 9110 5.6.1): a value whose members are all `100-continue` is handled as a `100-continue`
-expectation (sending `100 Continue` for HTTP/1.1 and ignoring it for HTTP/1.0), a value with a member other
-than `100-continue` is answered `417 Expectation Failed`, and a value that carries no member is treated as
-absent. Absolute-form request targets such as `GET http://example.com/ HTTP/1.1` are accepted (RFC 7230);
-routing and logging use the path. A request target must be one of the four forms (RFC 9112 3.2):
-origin-form (a target starting with `/`), absolute-form (a URI with a scheme),
-authority-form (`uri-host ":" port`, only for `CONNECT`), or asterisk-form (`*`, only for `OPTIONS`); a
-target that matches none of them is answered `400 Bad Request`. A target that starts with `?` (an empty
+expectation (sending `100 Continue` for HTTP/1.1 and ignoring it for HTTP/1.0), a value with a member whose
+expectation token is not `100-continue` is answered `417 Expectation Failed`, and a value that carries no member is
+treated as absent. An expectation is `token [ "=" ( token / quoted-string ) ] parameters`
+(RFC 9110 5.6.6), so parameters and a value on the token do not stop it being a `100-continue`
+expectation. Absolute-form request targets such as `GET http://example.com/ HTTP/1.1` are accepted
+(RFC 9112 3.2.2); routing and logging use the target URI's path (RFC 9112 3.3), so a target for any scheme
+(`ftp://example.com/healthz`, `http:/healthz`) is routed on its path component. A request target must be one
+of the four forms (RFC 9112 3.2): origin-form (an absolute path, or an empty path with a query),
+absolute-form (a URI with a scheme), authority-form (`uri-host ":" port`, only for `CONNECT`), or
+asterisk-form (`*`, only for `OPTIONS`); a target that matches none of them is answered `400 Bad Request`.
+An origin-form path and query are ASCII with well-formed percent-escapes (RFC 3986 3.1, 3.3, 3.4), so a
+target containing a `#` fragment, a non-ASCII byte or a malformed percent-escape is answered
+`400 Bad Request` rather than being autocorrected (RFC 9112 3.2). A target that starts with `?` (an empty
 path with a query, e.g. `GET ?q=1 HTTP/1.1`) is also accepted and routed and logged as `/` (RFC 3986 6.2.3).
 
-A higher `HTTP/1.x` minor version such as `HTTP/1.2` is processed as HTTP/1.1 (RFC 7230 2.6). A version
-token that is not `HTTP/` followed by a non-empty digit run, a `.`, and another non-empty digit run (such
-as `HTTP/1.` or `HTTP/1.x`) is malformed and answered `400 Bad Request`, while an unsupported major
-version (such as `HTTP/2.0`) is answered `505 HTTP Version Not Supported`.
+A higher `HTTP/1.x` minor version such as `HTTP/1.2` is processed as HTTP/1.1 (RFC 9110 2.5). A version
+token that is not `HTTP/` followed by one digit, a `.`, and another digit (such
+as `HTTP/1.`, `HTTP/1.x` or `HTTP/1.10`) is malformed and answered `400 Bad Request`, while an unsupported
+major version (such as `HTTP/2.0`) is answered `505 HTTP Version Not Supported`.
 
 The request body length comes from the final transfer coding when a `Transfer-Encoding` is present
 (RFC 9112 6.3); this server decodes no transfer coding, so a final `chunked` coding is answered
@@ -123,14 +133,21 @@ carrying a `Transfer-Encoding` is answered `400 Bad Request` because its framing
 (RFC 9112 6.1). Without a `Transfer-Encoding`, a `Content-Length` whose comma-separated values are
 all the same decimal value frames the body (RFC 9112 6.3 rule 5).
 
-The parser is lenient in a few places: a bare LF is accepted as a line terminator, EOF inside the header
-block ends the head (the request is served as if the blank line had arrived), and a duplicate `Host` is rejected
-for HTTP/1.0 as well as HTTP/1.1. Multiple `Accept-Language` field lines are combined in order, as if they had
-been sent as one comma-separated list (RFC 9110 5.3), as are multiple `Content-Length` field lines.
+The parser is lenient in a few places: a bare LF is accepted as a line terminator, EOF ends the request line or
+the header block (the request is served as if the CRLF and the blank line had arrived), and leading blank lines
+before the request line are skipped (RFC 9112 2.2). Optional whitespace around a field value and around the elements
+of a comma-separated list is SP and HTAB only (RFC 9110 5.6.3), so a value padded with a non-ASCII space (such as
+NBSP) is not a length or a valid host, and the field that owns it rejects it. The request line is split on SP, HTAB,
+VT, FF and bare CR (RFC 9112 3), so a line separated by any other character (such as a non-ASCII space) is a malformed
+request line. A duplicate `Host` is rejected for HTTP/1.0 as well as HTTP/1.1, and an empty `Host` value is rejected
+too, since a server may reject an empty authority for `http` and `https` (RFC 9112 3.3). Multiple
+`Accept-Language` field lines are combined in order, as if they had been sent as one comma-separated list
+(RFC 9110 5.3), as are multiple `Content-Length` field lines.
 Each `q` weight must match the RFC 9110 `qvalue` grammar
 `qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] )`, so `0`, `0.5`, `0.125`, `1` and `1.000` are
 accepted while `.5`, `00.5`, `+0.5`, `1e-1`, `0.0001`, `0.1234` and `1.5` are not; a malformed weight drops that
-entry, and so does a tag that is not a `language-range` (RFC 4647 2.1). A `Host` field value must be a
+entry, and so does a tag that is not a `language-range` (RFC 4647 2.1). Whitespace around the `q` name and the
+`=` is tolerated, and parameters other than `q` are ignored. A `Host` field value must be a
 `uri-host [":" port ]` (RFC 9110 7.2), so `user@host` (userinfo), `[::1` (an unterminated IP-literal) and `%zz`
 (a bad percent-escape) are rejected with `400 Bad Request`.
 
@@ -146,9 +163,11 @@ The fields are, in order: the ISO-8601 UTC timestamp, the peer address (or `-` w
 request method, the request path, the resolved language, the response status code, and the time spent
 serving the request in milliseconds with one decimal.
 
-The timestamp is the moment the line is written, and the method, path and language fields are sanitized before
-they are logged: control characters become `?`, and a field longer than 120 characters is truncated with `...`. A
-rejected connection is logged as a `status=503` line with `-` as its method, path and language.
+The timestamp is the moment the line is formatted, and the method, path and language fields are sanitized
+before they are logged: control characters become `?`, and a field longer than 120 characters is truncated with
+`...`. A rejected connection is logged as a `status=503` line with `-` as its method, path and language, and a
+`408` whose request head or body was parsed far enough logs the method and path it had read, with `-` for what it
+had not reached.
 
 For example:
 
@@ -193,9 +212,10 @@ Responses to `/` may carry one additional header:
 - `Content-Language: <code>` — sent when the greeting came from the catalog, i.e. whenever `--text` was
   not given.
 
-The `/` catalog responses — the greeting and the language `406` — extend `Vary` to
+The `/` catalog responses — the greeting and a `406` from language negotiation — extend `Vary` to
 `Accept-Language, Accept-Encoding`, because the body depends on the request's `Accept-Language` header even when
-it is absent. `--lang` and `--text` responses vary on `Accept-Encoding` only.
+it is absent. `--lang` and `--text` responses vary on `Accept-Encoding` only, as does a `406` from the
+`identity` refusal, which does not depend on the request's language.
 
 `/healthz` and every other response carry no other extra headers; the `405` carries `Allow: GET, HEAD` and the
 `503` rejection carries `Retry-After: 1` and `Vary: Accept-Encoding`. Every response is written as `HTTP/1.1`, even
@@ -207,10 +227,11 @@ For every request to `/`, the greeting is resolved in this order:
 
 1. `--text <STRING>` — if given, it replaces the greeting for **every** request, regardless of language.
 2. `--lang <CODE>` — if given, that language is used for every request, ignoring request headers.
-3. The request's `Accept-Language` header — the highest-quality catalog language wins, where an
-   exact range beats the `*` wildcard and a language marked `q=0` is never served. A header that leaves
-   no catalog language acceptable is answered `406 Not Acceptable`; an absent, empty or malformed header
-   keeps the `en` default.
+3. The request's `Accept-Language` header — the highest-quality catalog language wins. The most
+   specific matching range decides a language's weight, so a range that exactly names a language beats a
+   range that only shares its primary subtag, which in turn beats the `*` wildcard (RFC 4647 3.3.1), and a
+   language marked `q=0` is never served. A header that leaves no catalog language acceptable is answered
+   `406 Not Acceptable`; an absent, empty or malformed header keeps the `en` default.
 4. `en` — the default.
 
 Independently of the language, a request that refuses the `identity` content coding — `Accept-Encoding: identity;q=0`,
@@ -220,8 +241,12 @@ no content coding (RFC 9110 12.5.3).
 A plain `curl http://127.0.0.1:21212/` with no language arguments or headers therefore still returns
 `200 OK` with the English greeting.
 
-Language codes are matched case-insensitively on the primary subtag, so `nl-NL` resolves to `nl`, `pt-BR` to
-`pt`, `zh-CN` to `zh`, and `en-US` to `en`.
+A language range matches a catalog language only when it equals it (case-insensitively) or is a prefix of it
+followed by `-` (RFC 4647 3.3.1), which is the matching scheme RFC 9110 12.5.4 assigns to HTTP. Since every
+catalog language is a primary subtag, that means an exact range; where no range matches, a range whose primary
+subtag is the catalog language is accepted as well (the lookup form, RFC 4647 3.4). So `nl-NL` resolves to `nl`,
+`pt-BR` to `pt`, `zh-CN` to `zh`, and `en-US` to `en`, while `Accept-Language: en-US, en;q=0` is answered
+`406 Not Acceptable` because the exact range `en;q=0` decides the weight of `en`.
 
 ## Supported languages
 

@@ -67,6 +67,9 @@ const LOG_QUEUE: usize = 256;
 /// `Server` response header value.
 const SERVER: &str = concat!("helloworld/", env!("CARGO_PKG_VERSION"));
 
+/// Status line text of the `408` response, shared by every timeout path.
+const TIMEOUT_STATUS: &str = "408 Request Timeout";
+
 /// `Vary` value for responses whose body does not depend on the request's language.
 const VARY_ENCODING: &str = "Accept-Encoding";
 
@@ -81,6 +84,23 @@ const VARY_LANGUAGE: &str = "Accept-Language, Accept-Encoding";
 const KNOWN_METHODS: [&str; 9] = [
     "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
 ];
+
+/// Length of the longest method name in [`KNOWN_METHODS`].
+const LONGEST_METHOD: usize = longest_method();
+
+/// Compute the longest method name length at compile time, so the two cannot drift.
+const fn longest_method() -> usize {
+    let mut longest = 0;
+    let mut index = 0;
+    while index < KNOWN_METHODS.len() {
+        let len = KNOWN_METHODS[index].len();
+        if len > longest {
+            longest = len;
+        }
+        index += 1;
+    }
+    longest
+}
 
 /// Weekday names for IMF-fixdate formatting, indexed by day of week.
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -280,20 +300,34 @@ fn reject_busy(stream: &TcpStream, logger: &Logger, started: Instant) {
 /// [`LINGER_TIMEOUT`] in total, or after [`MAX_LINGER_BYTES`] bytes.
 fn lingering_close(stream: &TcpStream) {
     let _ = stream.shutdown(Shutdown::Write);
-    let deadline = Instant::now() + LINGER_TIMEOUT;
+    let mut deadline = SocketDeadline {
+        stream,
+        deadline: Instant::now() + LINGER_TIMEOUT,
+    };
     let mut scratch = [0_u8; 4096];
+    drain(stream, MAX_LINGER_BYTES, &mut scratch, &mut deadline);
+}
+
+/// Read from `reader` until EOF, the deadline, or `max` octets.
+///
+/// Returns the number of octets read, so both bounds are observable.
+fn drain<R: Read, D: Deadline>(
+    mut reader: R,
+    max: usize,
+    scratch: &mut [u8],
+    deadline: &mut D,
+) -> usize {
     let mut drained = 0_usize;
-    let mut stream = stream;
-    while drained < MAX_LINGER_BYTES {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+    while drained < max {
+        if deadline.arm().is_err() {
             break;
         }
-        match stream.read(&mut scratch) {
+        match reader.read(scratch) {
             Ok(0) | Err(_) => break,
             Ok(read) => drained += read,
         }
     }
+    drained
 }
 
 /// Apply the socket timeouts and serve one connection.
@@ -315,8 +349,8 @@ fn handle_connection(stream: TcpStream, config: &Config, logger: &Logger) -> std
     match handle(&mut reader, &mut writer, config, &mut deadline) {
         Ok(Some(info)) => logger.send(log_line(peer, &info, started.elapsed())),
         Ok(None) => {}
-        Err(Failure::TimedOut { head_only }) => {
-            if let Some(info) = answer_timeout(&mut writer, head_only) {
+        Err(Failure::TimedOut(info)) => {
+            if let Some(info) = answer_timeout(&mut writer, info) {
                 logger.send(log_line(peer, &info, started.elapsed()));
             }
         }
@@ -346,12 +380,9 @@ fn is_disconnect(err: &io::Error) -> bool {
 /// How a request ended when it produced no response.
 #[derive(Debug)]
 enum Failure {
-    /// The request head or body did not arrive before the deadline; `head_only`
-    /// records whether the client used `HEAD`.
-    TimedOut {
-        /// Whether the request method was `HEAD`.
-        head_only: bool,
-    },
+    /// The request head or body did not arrive before the deadline; the carried
+    /// description names the method and path that were known.
+    TimedOut(RequestInfo),
     /// The connection failed; a write timeout means the client stopped reading.
     Io(io::Error),
 }
@@ -365,12 +396,13 @@ impl From<io::Error> for Failure {
 /// Write the `408 Request Timeout` response and describe it.
 ///
 /// Shared by `handle` (deadline expired) and `handle_connection` (socket read
-/// timeout) so both paths produce byte-identical output; the request may be
-/// unparsed, hence the `-` method/path/lang.
-fn answer_timeout<W: Write>(writer: &mut W, head_only: bool) -> Option<RequestInfo> {
+/// timeout) so both paths produce byte-identical output; `info` carries the method
+/// and path when they were parsed, and the body is omitted for a `HEAD` request.
+fn answer_timeout<W: Write>(writer: &mut W, info: RequestInfo) -> Option<RequestInfo> {
+    let head_only = info.method == "HEAD";
     reply(
         writer,
-        RequestInfo::new("-", "-", "-", "408 Request Timeout"),
+        info,
         "request timeout\n",
         &[],
         VARY_ENCODING,
@@ -382,8 +414,13 @@ fn answer_timeout<W: Write>(writer: &mut W, head_only: bool) -> Option<RequestIn
 
 /// Outcome of reading one line.
 enum ReadLine {
-    /// A line without its trailing CRLF.
-    Line(String),
+    /// A line without its trailing CRLF, plus the octets it occupied on the wire.
+    Line {
+        /// Line content, without the terminator.
+        text: String,
+        /// Octets the line occupied on the wire, including its terminator.
+        wire: usize,
+    },
     /// The line exceeded the configured limit.
     TooLong,
     /// The input ended before any byte was read.
@@ -412,14 +449,14 @@ fn read_line<R: BufRead, D: Deadline>(
             return Ok(if buf.is_empty() {
                 ReadLine::Eof
             } else {
-                finish_line(buf, limit)
+                finish_line(buf, limit, 0)
             });
         }
         match available.iter().position(|&byte| byte == b'\n') {
             Some(index) => {
                 buf.extend_from_slice(&available[..index]);
                 reader.consume(index + 1);
-                return Ok(finish_line(buf, limit));
+                return Ok(finish_line(buf, limit, 1));
             }
             None => {
                 let len = available.len();
@@ -434,18 +471,25 @@ fn read_line<R: BufRead, D: Deadline>(
     }
 }
 
-/// Classify a line whose trailing CRLF has already been removed from the input.
+/// Classify a line whose terminator has already been removed from the input.
 ///
-/// Strips one trailing `\r` and returns [`ReadLine::TooLong`] when more than
-/// `limit` content bytes remain.
-fn finish_line(buf: &mut Vec<u8>, limit: usize) -> ReadLine {
-    if buf.last() == Some(&b'\r') {
+/// `terminator` is the number of octets that followed the content: `2` for CRLF,
+/// `1` for a bare LF and `0` when EOF ended the line. The returned `wire` count is
+/// the exact number of octets the line occupied, so the header-block limit is
+/// measured on the wire.
+fn finish_line(buf: &mut Vec<u8>, limit: usize, terminator: usize) -> ReadLine {
+    let had_cr = buf.last() == Some(&b'\r');
+    if had_cr {
         buf.pop();
     }
+    let wire = buf.len() + usize::from(had_cr) + terminator;
     if buf.len() > limit {
         return ReadLine::TooLong;
     }
-    ReadLine::Line(String::from_utf8_lossy(buf).to_string())
+    ReadLine::Line {
+        text: String::from_utf8_lossy(buf).to_string(),
+        wire,
+    }
 }
 
 /// Arms the read deadline before each blocking read of the request.
@@ -487,10 +531,10 @@ impl Deadline for SocketDeadline<'_> {
 ///
 /// The `408` itself is written once by the caller (`handle_connection`, or the
 /// test harness), so a write that fails after a response has been delivered can
-/// never append a second `408`.
-fn timeout_or(err: io::Error, head_only: bool) -> Result<Option<RequestInfo>, Failure> {
+/// never append a second `408`; `info` describes the request so far.
+fn timeout_or(err: io::Error, info: RequestInfo) -> Result<Option<RequestInfo>, Failure> {
     match err.kind() {
-        ErrorKind::TimedOut | ErrorKind::WouldBlock => Err(Failure::TimedOut { head_only }),
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => Err(Failure::TimedOut(info)),
         _ => Err(Failure::Io(err)),
     }
 }
@@ -517,7 +561,7 @@ fn transfer_encoding_failure(
     {
         present = true;
         for element in value.split(',') {
-            let coding = element.split(';').next().unwrap_or("").trim();
+            let coding = trim_ows(element.split(';').next().unwrap_or(""));
             if !coding.is_empty() {
                 final_coding = Some(coding);
             }
@@ -550,7 +594,7 @@ fn content_length(headers: &[(String, String)]) -> Result<u64, (&'static str, &'
     for (_, value) in headers.iter().filter(|(name, _)| name == "content-length") {
         present = true;
         for element in value.split(',') {
-            let element = element.trim();
+            let element = trim_ows(element);
             if element.is_empty() {
                 continue;
             }
@@ -579,7 +623,7 @@ fn content_length(headers: &[(String, String)]) -> Result<u64, (&'static str, &'
     }
     match parsed {
         Some(value) => Ok(value),
-        None => Err(("413 Payload Too Large", "payload too large\n")),
+        None => Err(("413 Content Too Large", "payload too large\n")),
     }
 }
 
@@ -601,20 +645,22 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
     let request_line = loop {
         match read_line(reader, MAX_REQUEST_LINE, &mut buf, deadline) {
             Err(err) => {
-                let head_only = line_method(&buf) == "HEAD";
-                return timeout_or(err, head_only);
+                let method = line_method(&buf);
+                return timeout_or(err, RequestInfo::new(&method, "-", "-", TIMEOUT_STATUS));
             }
             Ok(ReadLine::Eof) => return Ok(None),
             Ok(ReadLine::TooLong) => {
                 let method = line_method(&buf);
                 let head_only = method == "HEAD";
-                // The separators a request line may use (RFC 9112 3); without one,
-                // the method token alone is already at least the limit long, so it is
-                // longer than any method this server implements (501).
-                let method_is_complete = buf
+                // The separators a request line may use (RFC 9112 3); a method
+                // token longer than any method this server implements is answered
+                // `501` (RFC 9112 3), so only a complete short method followed
+                // by an over-long target is a `414`.
+                let method_is_known = buf
                     .iter()
-                    .any(|b| matches!(b, b' ' | b'\t' | b'\x0b' | b'\x0c' | b'\r'));
-                if !method_is_complete {
+                    .position(|b| matches!(b, b' ' | b'\t' | b'\x0b' | b'\x0c' | b'\r'))
+                    .is_some_and(|end| buf[..end].len() <= LONGEST_METHOD);
+                if !method_is_known {
                     return fail(
                         writer,
                         &method,
@@ -635,15 +681,15 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                     head_only,
                 );
             }
-            Ok(ReadLine::Line(line)) => {
-                if !line.is_empty() {
-                    break line;
+            Ok(ReadLine::Line { text, .. }) => {
+                if !text.is_empty() {
+                    break text;
                 }
             }
         }
     };
 
-    let mut parts = request_line.split_whitespace();
+    let mut parts = split_elements(&request_line);
     let first = parts.next();
     let head_only = first == Some("HEAD");
     let (method, target, version) = match (first, parts.next(), parts.next(), parts.next()) {
@@ -661,8 +707,8 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
         }
     };
 
-    // Absolute-form targets are accepted (RFC 7230 5.3.2); routing and
-    // logging use the origin-form path only.
+    // Absolute-form targets are accepted (RFC 9112 3.2.2); routing and
+    // logging use the target URI's path component (RFC 9112 3.3).
     let path = request_path(target).to_string();
     // The target must match one of the four request-target forms (RFC 9112 3.2).
     if !target_is_valid(method, target) {
@@ -676,7 +722,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             head_only,
         );
     }
-    if !is_token(method) || target.bytes().any(|b| b.is_ascii_control()) {
+    if !is_token(method) {
         return fail(
             writer,
             method,
@@ -718,7 +764,9 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
     let mut header_bytes = 0_usize;
     loop {
         match read_line(reader, MAX_HEADER_LINE, &mut buf, deadline) {
-            Err(err) => return timeout_or(err, head_only),
+            Err(err) => {
+                return timeout_or(err, RequestInfo::new(method, &path, "-", TIMEOUT_STATUS));
+            }
             Ok(ReadLine::Eof) => break,
             Ok(ReadLine::TooLong) => {
                 return fail(
@@ -731,11 +779,11 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                     head_only,
                 );
             }
-            Ok(ReadLine::Line(line)) => {
+            Ok(ReadLine::Line { text: line, wire }) => {
                 if line.is_empty() {
                     break;
                 }
-                header_bytes += buf.len() + 2;
+                header_bytes += wire;
                 if header_bytes > MAX_HEADER_BYTES || headers.len() >= MAX_HEADERS {
                     return fail(
                         writer,
@@ -797,13 +845,13 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
                         head_only,
                     );
                 }
-                headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+                headers.push((name.to_ascii_lowercase(), trim_ows(value).to_string()));
             }
         }
     }
 
     // A valid `Host` is required for HTTP/1.1 before any framing decision
-    // (RFC 7230 5.4), so a bad one is always a 400.
+    // (RFC 9112 3.2), so a bad one is always a 400.
     if !host_is_valid(version, &headers) {
         return fail(
             writer,
@@ -853,7 +901,7 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
             writer,
             method,
             &path,
-            "413 Payload Too Large",
+            "413 Content Too Large",
             "payload too large\n",
             VARY_ENCODING,
             head_only,
@@ -904,11 +952,13 @@ fn handle<R: BufRead, W: Write, D: Deadline>(
     let mut scratch = [0_u8; 8192];
     while remaining > 0 {
         if let Err(err) = deadline.arm() {
-            return timeout_or(err, head_only);
+            return timeout_or(err, RequestInfo::new(method, &path, "-", TIMEOUT_STATUS));
         }
         let read = match (&mut *reader).take(remaining).read(&mut scratch) {
             Ok(read) => read,
-            Err(err) => return timeout_or(err, head_only),
+            Err(err) => {
+                return timeout_or(err, RequestInfo::new(method, &path, "-", TIMEOUT_STATUS));
+            }
         };
         if read == 0 {
             break;
@@ -1096,20 +1146,23 @@ fn greeting(
 /// multiple field lines with the same name are combined in order (RFC 9110 5.3);
 /// empty list elements are ignored (RFC 9110 5.6.1). The only expectation this
 /// server recognizes is `100-continue` (ASCII case-insensitive), so the value is
-/// recognized iff every member is `100-continue`. Returns `None` when the field is
-/// absent or carries no member, `Some(true)` when every member is `100-continue`,
-/// and `Some(false)` when a member is not.
+/// recognized iff every member names that expectation; the member's token is
+/// everything before its first `=` or `;`, since an expectation is
+/// `token [ "=" ( token / quoted-string ) ] parameters` (RFC 9110 5.6.6). Returns
+/// `None` when the field is absent or carries no member, `Some(true)` when every
+/// member is `100-continue`, and `Some(false)` when a member is not.
 fn expects_continue(headers: &[(String, String)]) -> Option<bool> {
     let mut present = false;
     let mut recognized = true;
     for (_, value) in headers.iter().filter(|(name, _)| name == "expect") {
         for element in value.split(',') {
-            let element = element.trim();
+            let element = trim_ows(element);
             if element.is_empty() {
                 continue;
             }
             present = true;
-            if !element.eq_ignore_ascii_case("100-continue") {
+            let name = trim_ows(element.split(['=', ';']).next().unwrap_or(""));
+            if !name.eq_ignore_ascii_case("100-continue") {
                 recognized = false;
             }
         }
@@ -1138,7 +1191,7 @@ fn combined_header(headers: &[(String, String)], name: &str) -> Option<String> {
     joined
 }
 
-/// Whether `name` is a valid HTTP `token` (RFC 7230 3.2.6).
+/// Whether `name` is a valid HTTP `token` (RFC 9110 5.6.2).
 fn is_token(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -1146,18 +1199,48 @@ fn is_token(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
-/// Whether `target` begins with a URI `scheme ":"` (RFC 3986 3.1).
-fn has_scheme(target: &str) -> bool {
-    let Some((scheme, _)) = target.split_once(':') else {
-        return false;
-    };
-    scheme
+/// Strip optional whitespace (RFC 9110 5.6.3) from both ends of `value`.
+///
+/// `OWS = *( SP / HTAB )`, so only SP and HTAB are removed. Any other
+/// whitespace — in particular a non-ASCII character such as NBSP — is left in
+/// place, so the grammar of the field that owns the value rejects it rather than
+/// silently accepting a value a stricter recipient reads differently.
+pub fn trim_ows(value: &str) -> &str {
+    value.trim_matches([' ', '\t'])
+}
+
+/// Split a request line into its elements (RFC 9112 3).
+///
+/// A recipient MAY parse the request line on whitespace-delimited word boundaries,
+/// where that whitespace is one or more of SP, HTAB, VT (%x0B), FF (%x0C) or bare
+/// CR; runs of separators count as one boundary and leading or trailing
+/// separators are ignored. Any other character — in particular non-ASCII whitespace
+/// such as NBSP — stays inside the token, so a line a stricter recipient sees as
+/// one token is not split here either.
+fn split_elements(line: &str) -> impl Iterator<Item = &str> + '_ {
+    line.split([' ', '\t', '\x0b', '\x0c', '\r'])
+        .filter(|element| !element.is_empty())
+}
+
+/// Split an `absolute-form` target into its scheme and the remainder.
+///
+/// Returns `None` when `target` does not begin with a `scheme ":"`
+/// (RFC 3986 3.1).
+fn split_scheme(target: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = target.split_once(':')?;
+    let valid = scheme
         .bytes()
         .next()
         .is_some_and(|b| b.is_ascii_alphabetic())
         && scheme
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b));
+    valid.then_some((scheme, rest))
+}
+
+/// Whether `target` begins with a URI `scheme ":"` (RFC 3986 3.1).
+fn has_scheme(target: &str) -> bool {
+    split_scheme(target).is_some()
 }
 
 /// Whether `target` is an `authority-form` target: `uri-host ":" port` (RFC 9112 3.2.3).
@@ -1171,14 +1254,91 @@ fn authority_form_is_valid(target: &str) -> bool {
     }
 }
 
+/// Whether `byte` may appear unescaped in a `pchar` (RFC 3986 3.3).
+///
+/// `pchar = unreserved / pct-encoded / sub-delims / ":" / "@"`, so this covers
+/// every character of that production except the `%` of `pct-encoded`, which
+/// [`pct_escapes_are_valid`] checks.
+fn is_pchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@%".contains(&byte)
+}
+
+/// Whether `byte` may appear in a path (RFC 3986 3.3).
+///
+/// `absolute-path = 1*( "/" segment )` with `segment = *pchar`, so a path is
+/// `pchar` plus the `/` separators between segments.
+fn is_path(byte: u8) -> bool {
+    is_pchar(byte) || byte == b'/'
+}
+
+/// Whether `byte` may appear in a query (RFC 3986 3.4).
+///
+/// `query = *( pchar / "/" / "?" )`.
+fn is_query(byte: u8) -> bool {
+    is_path(byte) || byte == b'?'
+}
+
+/// Whether every `%` in `value` introduces a two-digit hexadecimal escape.
+///
+/// `pct-encoded = "%" HEXDIG HEXDIG` (RFC 3986 2.1).
+fn pct_escapes_are_valid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Whether `target` is an `origin-form` target: `absolute-path [ "?" query ]`
+/// (RFC 9112 3.2.1).
+///
+/// The path and query are ASCII (RFC 3986 3.1), so a non-ASCII byte, a `#`
+/// fragment or a malformed percent-escape makes the request-line invalid. A target
+/// with an empty path is accepted as `/` (RFC 3986 6.2.3), so a target that
+/// begins with `?` is valid.
+fn origin_form_is_valid(target: &str) -> bool {
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (target, ""),
+    };
+    let path_ok = path.is_empty()
+        || (path.starts_with('/') && path.bytes().all(is_path) && pct_escapes_are_valid(path));
+    path_ok && query.bytes().all(is_query) && pct_escapes_are_valid(query)
+}
+
+/// Whether `target` is an `absolute-form` target: a URI with a scheme
+/// (RFC 9112 3.2.2).
+///
+/// The grammar is `absolute-URI = scheme ":" hier-part [ "?" query ]`
+/// (RFC 3986 4.3), which has no fragment, so a `#`, a non-ASCII byte or a
+/// malformed percent-escape makes the request-line invalid. The `[` and `]` of an
+/// IP-literal host are accepted in the authority component.
+fn absolute_form_is_valid(target: &str) -> bool {
+    has_scheme(target)
+        && target
+            .bytes()
+            .all(|byte| is_query(byte) || matches!(byte, b'[' | b']'))
+        && pct_escapes_are_valid(target)
+}
+
 /// Whether `target` matches one of the four `request-target` forms (RFC 9112 3.2).
 ///
 /// A `CONNECT` request's target is `authority-form`, `uri-host ":" port`, and is
 /// validated as such (RFC 9112 3.2.3). Otherwise `origin-form` is an absolute
-/// path, so a target that starts with `/` is valid (`?` is also accepted, keeping
-/// the documented empty-path leniency of RFC 3986 6.2.3), and `absolute-form` is a
-/// URI with a scheme, so any target that begins with a `scheme ":"` is valid.
-/// `asterisk-form` is `*` and is only valid for a server-wide `OPTIONS` request.
+/// path, `absolute-form` is a URI with a scheme, and `asterisk-form` is `*`, which
+/// is only valid for a server-wide `OPTIONS` request. A target that matches none
+/// of the forms makes the request-line invalid (RFC 9112 3.2).
 fn target_is_valid(method: &str, target: &str) -> bool {
     if method == "CONNECT" {
         return authority_form_is_valid(target);
@@ -1186,35 +1346,35 @@ fn target_is_valid(method: &str, target: &str) -> bool {
     if target == "*" {
         return method == "OPTIONS";
     }
-    target.starts_with(['/', '?']) || has_scheme(target)
+    origin_form_is_valid(target) || absolute_form_is_valid(target)
 }
 
-/// Strip an absolute-form request target down to its origin-form path.
+/// Reduce an absolute-form request target to its origin-form path and query.
 ///
-/// A server must accept absolute-form targets (RFC 7230 5.3.2); the scheme and
-/// authority are ignored, and the path is routed and logged as usual.
+/// A server must accept absolute-form targets (RFC 9112 3.2.2) and parse them
+/// into their generic components (RFC 9112 3.3), so the scheme is dropped and,
+/// when an authority component follows, so is everything up to the first `/`, `?` or
+/// `#`; a target with no authority keeps its path. A target that is not
+/// absolute-form is returned unchanged.
 fn origin_path(target: &str) -> &str {
-    let rest = ["http://", "https://"].iter().find_map(|scheme| {
-        target
-            .get(..scheme.len())
-            .filter(|head| head.eq_ignore_ascii_case(scheme))
-            .map(|_| &target[scheme.len()..])
-    });
-    match rest {
-        Some(rest) => match rest.find(['/', '?', '#']) {
-            Some(index) => &rest[index..],
+    let Some((_, rest)) = split_scheme(target) else {
+        return target;
+    };
+    match rest.strip_prefix("//") {
+        Some(authority_and_path) => match authority_and_path.find(['/', '?', '#']) {
+            Some(index) => &authority_and_path[index..],
             None => "/",
         },
-        None => target,
+        None => rest,
     }
 }
 
-/// Extract the origin-form path a request target routes on.
+/// Extract the origin-form path a request target routes and logs on.
 ///
-/// Absolute-form targets are reduced to their origin form (RFC 7230 5.3.2), the
-/// query and fragment are dropped, and a target with an empty path (`?q=1`,
-/// `http://host?q=1`, `http://host#f`) routes as `/`, since an empty path is
-/// equivalent to `/` (RFC 3986 6.2.3).
+/// Absolute-form targets are reduced to their origin form (RFC 9112 3.3), the query
+/// and fragment are dropped, and a target with an empty path (`?q=1`,
+/// `http://host?q=1`) routes as `/`, since an empty path is equivalent to `/`
+/// (RFC 3986 6.2.3).
 fn request_path(target: &str) -> &str {
     let path = origin_path(target).split(['?', '#']).next().unwrap_or("");
     if path.is_empty() {
@@ -1229,7 +1389,7 @@ fn request_path(target: &str) -> &str {
 enum Version {
     /// HTTP/1.0.
     Http10,
-    /// HTTP/1.1, or any higher `HTTP/1.x` minor (RFC 7230 2.6).
+    /// HTTP/1.1, or any higher `HTTP/1.x` minor (RFC 9110 2.5).
     Http11,
 }
 
@@ -1247,11 +1407,10 @@ enum ParsedVersion {
 /// Parse a request's HTTP version token.
 ///
 /// The grammar is `HTTP-version = HTTP-name "/" DIGIT "." DIGIT` (RFC 9112 2.3),
-/// so the token must be `HTTP/`, a non-empty run of digits, `.`, and another
-/// non-empty run of digits. A token whose major version is not `1` is
-/// [`ParsedVersion::Unsupported`]; a token that does not match the grammar is
+/// so each component is exactly one digit. A token whose major version is not `1`
+/// is [`ParsedVersion::Unsupported`]; a token that does not match the grammar is
 /// [`ParsedVersion::Malformed`]. A higher `1.x` minor version is processed as
-/// 1.1 (RFC 7230 2.6).
+/// 1.1 (RFC 9110 2.5).
 fn parse_version(version: &str) -> ParsedVersion {
     let Some(rest) = version.strip_prefix("HTTP/") else {
         return ParsedVersion::Malformed;
@@ -1259,11 +1418,8 @@ fn parse_version(version: &str) -> ParsedVersion {
     let Some((major, minor)) = rest.split_once('.') else {
         return ParsedVersion::Malformed;
     };
-    if major.is_empty()
-        || minor.is_empty()
-        || !major.bytes().all(|b| b.is_ascii_digit())
-        || !minor.bytes().all(|b| b.is_ascii_digit())
-    {
+    let one_digit = |run: &str| run.len() == 1 && run.bytes().all(|b| b.is_ascii_digit());
+    if !one_digit(major) || !one_digit(minor) {
         return ParsedVersion::Malformed;
     }
     match major {
@@ -1278,11 +1434,9 @@ fn parse_version(version: &str) -> ParsedVersion {
 
 /// Method token of a possibly partial request line, for logging and `HEAD` detection.
 fn line_method(buf: &[u8]) -> String {
-    String::from_utf8_lossy(buf)
-        .split_whitespace()
-        .next()
-        .unwrap_or("-")
-        .to_string()
+    let line = String::from_utf8_lossy(buf);
+    let method = split_elements(&line).next().unwrap_or("-");
+    method.to_string()
 }
 
 /// Whether the `Host` header(s) satisfy the request's HTTP version.
@@ -1290,7 +1444,9 @@ fn line_method(buf: &[u8]) -> String {
 /// HTTP/1.1 requires exactly one non-empty `Host` whose value is a valid
 /// `uri-host [ ":" port ]` (RFC 9110 7.2); HTTP/1.0 makes the field optional,
 /// but a value that is present must still be a valid authority. Duplicates are
-/// rejected for both versions.
+/// rejected for both versions. An empty value is rejected as well: `reg-name` may be
+/// empty (RFC 3986 3.2.2), but for `http` and `https` an empty authority may
+/// be rejected by the server (RFC 9112 3.3).
 fn host_is_valid(version: Version, headers: &[(String, String)]) -> bool {
     let mut host = None;
     let mut count = 0_usize;
@@ -1607,7 +1763,7 @@ mod tests {
         let mut writer = Vec::new();
         let info = match handle(reader, &mut writer, config, deadline) {
             Ok(info) => info,
-            Err(Failure::TimedOut { head_only }) => answer_timeout(&mut writer, head_only),
+            Err(Failure::TimedOut(info)) => answer_timeout(&mut writer, info),
             Err(Failure::Io(err)) => panic!("io error: {err}"),
         };
         let response = String::from_utf8(writer).expect("response must be utf-8");
@@ -1840,12 +1996,12 @@ mod tests {
     }
 
     #[test]
-    fn oversized_content_length_is_payload_too_large() {
+    fn oversized_content_length_is_content_too_large() {
         let (_, info) = run(
             "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8388609\r\n\r\n",
             &default_config(),
         );
-        assert_eq!(info.expect("served").status, "413 Payload Too Large");
+        assert_eq!(info.expect("served").status, "413 Content Too Large");
     }
 
     #[test]
@@ -1867,12 +2023,12 @@ mod tests {
     }
 
     #[test]
-    fn overflowing_content_length_is_payload_too_large() {
+    fn overflowing_content_length_is_content_too_large() {
         let (_, info) = run(
             "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 99999999999999999999\r\n\r\n",
             &default_config(),
         );
-        assert_eq!(info.expect("served").status, "413 Payload Too Large");
+        assert_eq!(info.expect("served").status, "413 Content Too Large");
     }
 
     #[test]
@@ -2117,7 +2273,8 @@ mod tests {
     #[test]
     fn answer_timeout_writes_408() {
         let mut writer = Vec::new();
-        let info = answer_timeout(&mut writer, false).expect("served");
+        let info = answer_timeout(&mut writer, RequestInfo::new("-", "-", "-", TIMEOUT_STATUS))
+            .expect("served");
         assert_eq!(info.status, "408 Request Timeout");
         let response = String::from_utf8(writer).expect("response must be utf-8");
         assert!(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
@@ -2482,7 +2639,11 @@ mod tests {
             &default_config(),
             &mut CountdownDeadline { arms: head + 6 },
         );
-        assert_eq!(info.expect("served").status, "408 Request Timeout");
+        let info = info.expect("served");
+        assert_eq!(info.status, "408 Request Timeout");
+        // The head was parsed, so the access log names the method and path.
+        assert_eq!(info.method, "GET");
+        assert_eq!(info.path, "/");
     }
 
     #[test]
@@ -2494,7 +2655,10 @@ mod tests {
             &default_config(),
             &mut CountdownDeadline { arms: 4 },
         );
-        assert_eq!(info.expect("served").status, "408 Request Timeout");
+        let info = info.expect("served");
+        assert_eq!(info.status, "408 Request Timeout");
+        assert_eq!(info.method, "GET");
+        assert_eq!(info.path, "-");
     }
 
     #[test]
@@ -2535,6 +2699,53 @@ mod tests {
         }
         assert!(closed, "lingering_close drained past LINGER_TIMEOUT");
         handle.join().expect("join");
+    }
+
+    #[test]
+    fn drain_stops_at_the_byte_cap() {
+        // A reader with more data than the cap stops at the cap, not at EOF.
+        let data = vec![0_u8; MAX_LINGER_BYTES * 2];
+        let mut reader = Cursor::new(data);
+        let mut scratch = [0_u8; 4096];
+        assert_eq!(
+            drain(&mut reader, MAX_LINGER_BYTES, &mut scratch, &mut ()),
+            MAX_LINGER_BYTES
+        );
+    }
+
+    #[test]
+    fn drain_stops_at_eof_and_at_the_deadline() {
+        // EOF ends the drain early, so the returned count is what was read.
+        let mut reader = Cursor::new(vec![0_u8; 100]);
+        let mut scratch = [0_u8; 4096];
+        assert_eq!(
+            drain(&mut reader, MAX_LINGER_BYTES, &mut scratch, &mut ()),
+            100
+        );
+
+        // A deadline that expires first stops the drain as well.
+        let mut reader = Cursor::new(vec![0_u8; MAX_LINGER_BYTES * 2]);
+        assert_eq!(
+            drain(
+                &mut reader,
+                MAX_LINGER_BYTES,
+                &mut scratch,
+                &mut ExpiredDeadline
+            ),
+            0
+        );
+
+        // A deadline that expires mid-drain stops it where it expired.
+        let mut reader = Cursor::new(vec![0_u8; MAX_LINGER_BYTES * 2]);
+        assert_eq!(
+            drain(
+                &mut reader,
+                MAX_LINGER_BYTES,
+                &mut scratch,
+                &mut CountdownDeadline { arms: 3 }
+            ),
+            3 * scratch.len()
+        );
     }
 
     #[test]
@@ -2658,7 +2869,6 @@ mod tests {
         for request in [
             "GET http://localhost?x=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "GET ?x=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            "GET http://localhost#f HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ] {
             let (response, info) = run(request, &default_config());
             let info = info.expect("served");
@@ -2666,6 +2876,47 @@ mod tests {
             assert_eq!(info.path, "/", "was {request:?}");
             assert_eq!(body(&response), "Hello, World!\n");
         }
+    }
+
+    #[test]
+    fn fragment_in_target_is_bad_request() {
+        // A fragment is not part of any request-target form (RFC 9112 3.2.1),
+        // so it is an invalid request-line rather than a target to autocorrect.
+        for request in [
+            "GET /#f HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET http://localhost#f HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ] {
+            let (response, info) = run(request, &default_config());
+            let info = info.expect("served");
+            assert_eq!(info.status, "400 Bad Request", "was {request:?}");
+            assert_eq!(body(&response), "bad request\n");
+        }
+    }
+
+    #[test]
+    fn non_ascii_and_escaped_targets_are_validated() {
+        // The path and query are ASCII with well-formed percent-escapes
+        // (RFC 3986 3.3, 3.4), so a non-ASCII byte or a bad escape makes
+        // the request-line invalid.
+        for request in [
+            "GET /caf\u{e9} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /a[b HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /%zz HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /%4 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ] {
+            let (_, info) = run(request, &default_config());
+            let info = info.expect("served");
+            assert_eq!(info.status, "400 Bad Request", "was {request:?}");
+        }
+
+        // A well-formed escape is served, and the escape is not decoded.
+        let (_, info) = run(
+            "GET /a%2Fb HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        let info = info.expect("served");
+        assert_eq!(info.status, "404 Not Found");
+        assert_eq!(info.path, "/a%2Fb");
     }
 
     #[test]
@@ -2787,6 +3038,26 @@ mod tests {
     }
 
     #[test]
+    fn bare_lf_headers_are_counted_by_wire_bytes() {
+        // A bare LF terminates a line in one octet, so a header block of exactly
+        // 64 KiB on the wire is inside the limit and is served; counting a CRLF
+        // per line would put the same block over it.
+        let value = "a".repeat(3270);
+        let mut request = String::from("GET / HTTP/1.1\nHost: localhost\n");
+        for _ in 0..20 {
+            request.push_str("X-N: ");
+            request.push_str(&value);
+            request.push('\n');
+        }
+        request.push('\n');
+        // 16 + 20 * 3276 = 65536 octets of header block, then the blank line.
+        assert_eq!(request.len(), 15 + 16 + 20 * (5 + 3270 + 1) + 1);
+        let (response, info) = run(&request, &default_config());
+        assert_eq!(info.expect("served").status, "200 OK");
+        assert_eq!(body(&response), "Hello, World!\n");
+    }
+
+    #[test]
     fn http12_is_served_as_11() {
         let (response, info) = run(
             "GET / HTTP/1.2\r\nHost: localhost\r\n\r\n",
@@ -2829,9 +3100,9 @@ mod tests {
     }
 
     #[test]
-    fn query_and_fragment_are_stripped() {
+    fn query_is_stripped() {
         let (response, info) = run(
-            "GET /?x=1#f HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /?x=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
             &default_config(),
         );
         let info = info.expect("served");
@@ -2972,12 +3243,131 @@ mod tests {
             ParsedVersion::Supported(Version::Http11)
         );
         assert_eq!(
-            parse_version("HTTP/1.10"),
+            parse_version("HTTP/1.2"),
             ParsedVersion::Supported(Version::Http11)
         );
         assert_eq!(parse_version("HTTP/2.0"), ParsedVersion::Unsupported);
+        // Each component is exactly one digit (RFC 9112 2.3), so a longer run
+        // does not match the grammar.
+        assert_eq!(parse_version("HTTP/1.10"), ParsedVersion::Malformed);
+        assert_eq!(parse_version("HTTP/01.1"), ParsedVersion::Malformed);
         assert_eq!(parse_version("HTTP/1."), ParsedVersion::Malformed);
         assert_eq!(parse_version("FOO"), ParsedVersion::Malformed);
+    }
+
+    #[test]
+    fn multi_digit_version_tokens_are_bad_request() {
+        for version in ["HTTP/1.10", "HTTP/01.1", "HTTP/1.00"] {
+            let request = format!("GET / {version}\r\nHost: localhost\r\n\r\n");
+            let (_, info) = run(&request, &default_config());
+            assert_eq!(
+                info.expect("served").status,
+                "400 Bad Request",
+                "was {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_ows_is_trimmed_from_field_values() {
+        // Optional whitespace is SP and HTAB only (RFC 9110 5.6.3), so a
+        // non-ASCII space stays in the field value and the grammar of the
+        // field that owns it rejects the value.
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: \u{a0}5\r\n\r\nhello",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: \u{a0}evil.example\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity;q=\u{a0}0\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "200 OK");
+
+        // A non-ASCII space in a language range leaves it unmatched, so the
+        // default language is served.
+        let (response, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Language: \u{a0}nl\r\n\r\n",
+            &default_config(),
+        );
+        let info = info.expect("served");
+        assert_eq!(info.lang, "en");
+        assert_eq!(body(&response), "Hello, World!\n");
+
+        // SP and HTAB are stripped as OWS.
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: \t5 \t\r\n\r\nhello",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "200 OK");
+    }
+
+    #[test]
+    fn request_line_splits_on_the_rfc_separators() {
+        // A recipient MAY parse on whitespace-delimited word boundaries, where
+        // that whitespace is SP, HTAB, VT, FF or bare CR (RFC 9112 3); any other
+        // character stays inside the token, so the line is malformed.
+        let (_, info) = run(
+            "GET\u{a0}/\u{a0}HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "400 Bad Request");
+
+        let (response, info) = run(
+            "GET\t/\u{0b}HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &default_config(),
+        );
+        let info = info.expect("served");
+        assert_eq!(info.status, "200 OK");
+        assert_eq!(info.method, "GET");
+        assert_eq!(info.path, "/");
+        assert_eq!(body(&response), "Hello, World!\n");
+    }
+
+    #[test]
+    fn over_long_method_token_is_not_implemented() {
+        // The method token is longer than any method this server implements, so
+        // the line is answered 501 (RFC 9112 3) although the target is short.
+        let request = format!(
+            "{} / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "A".repeat(MAX_REQUEST_LINE)
+        );
+        let (response, info) = run(&request, &default_config());
+        let info = info.expect("served");
+        assert_eq!(info.status, "501 Not Implemented");
+        assert_eq!(body(&response), "not implemented\n");
+    }
+
+    #[test]
+    fn expect_member_with_parameters_is_recognized() {
+        // An expectation is `token [ "=" ( token / quoted-string ) ] parameters`
+        // (RFC 9110 5.6.6), so a 100-continue expectation that carries
+        // parameters or a value is still a 100-continue expectation.
+        for request in [
+            "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue;q=1\r\nContent-Length: 5\r\n\r\nhello",
+            "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue=foo\r\nContent-Length: 5\r\n\r\nhello",
+        ] {
+            let (response, info) = run(request, &default_config());
+            assert_eq!(info.expect("served").status, "200 OK", "was {request:?}");
+            assert!(
+                response.starts_with("HTTP/1.1 100 Continue\r\n\r\n"),
+                "was {request:?}"
+            );
+        }
+
+        // A parameter on another expectation still makes it unrecognized.
+        let (_, info) = run(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nExpect: nope;q=1\r\n\r\n",
+            &default_config(),
+        );
+        assert_eq!(info.expect("served").status, "417 Expectation Failed");
     }
 
     #[test]
@@ -2987,13 +3377,35 @@ mod tests {
         assert!(target_is_valid("GET", "/a?b"));
         assert!(target_is_valid("GET", "?q=1"));
         assert!(target_is_valid("GET", "http://host/x"));
+        assert!(target_is_valid("GET", "http://host"));
+        assert!(target_is_valid("GET", "http:/x"));
+        assert!(target_is_valid("GET", "ftp://host/x"));
         assert!(target_is_valid("GET", "foo:bar"));
         assert!(!target_is_valid("GET", "host"));
         assert!(!target_is_valid("GET", "foo/bar"));
+        assert!(!target_is_valid("GET", "/#f"));
+        assert!(!target_is_valid("GET", "/a[b"));
+        assert!(!target_is_valid("GET", "/%zz"));
+        assert!(!target_is_valid("GET", "/caf\u{e9}"));
         assert!(target_is_valid("CONNECT", "host:443"));
         assert!(target_is_valid("CONNECT", "[::1]:443"));
         assert!(!target_is_valid("CONNECT", "host"));
         assert!(!target_is_valid("CONNECT", "host:port"));
         assert!(!target_is_valid("CONNECT", "/path"));
+    }
+
+    #[test]
+    fn absolute_form_targets_reduce_to_their_path() {
+        for (target, path) in [
+            ("http://host/a?b", "/a"),
+            ("http://host?q=1", "/"),
+            ("http://host", "/"),
+            ("http:/x", "/x"),
+            ("https://host:8443/x", "/x"),
+            ("ftp://host/healthz", "/healthz"),
+            ("foo:bar", "bar"),
+        ] {
+            assert_eq!(request_path(target), path, "was {target:?}");
+        }
     }
 }
