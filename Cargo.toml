@@ -1,0 +1,10 @@
+[package]
+name = "helloworld"
+version = "0.1.0"
+edition = "2021"
+description = "Multilingual hello-world HTTP server with zero dependencies"
+license = "MIT"
+
+[[bin]]
+name = "helloworld"
+path = "src/main.rs"
